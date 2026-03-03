@@ -1,0 +1,1648 @@
+#!/bin/bash
+# claude-agent-runner — Polls Linear for issues labeled "agent", spawns isolated Claude instances
+#
+# Usage:
+#   claude-agent-runner                           Run for all configured workspaces/teams
+#   claude-agent-runner --auto-review             Run + auto-review PRs after creation
+#   claude-agent-runner --auto-fix                Run + auto-review + auto-fix loop
+#   claude-agent-runner --sequenced               Only pick up issues whose blockers are done
+#   claude-agent-runner --pipeline <file.md>      Parse requirements into Linear issues
+#   claude-agent-runner --review-pr <num> --repo <path>  Standalone PR review
+#   claude-agent-runner --cleanup                 Clean up merged worktrees
+#   claude-agent-runner --status                  Show active agents and worktrees
+#   claude-agent-runner --help                    Show usage
+#
+# Config: ~/.config/claude-agents/config.json
+# Logs:   ~/.config/claude-agents/logs/
+#
+# Requires: jq, claude, git, gh, curl
+# Optional: docker (for local_db), pnpm
+
+set -uo pipefail
+
+CONFIG="$HOME/.config/claude-agents/config.json"
+LOG_DIR="$HOME/.config/claude-agents/logs"
+LOCK_DIR="$HOME/.config/claude-agents/locks"
+SECRETS="$HOME/.config/claude-agents/secrets.env"
+
+mkdir -p "$LOG_DIR" "$LOCK_DIR"
+
+# Source secrets (API keys) — works in cron/background where ~/.zshrc isn't loaded
+if [ -f "$SECRETS" ]; then
+  # shellcheck disable=SC1090
+  source "$SECRETS"
+fi
+
+# Load config
+if [ ! -f "$CONFIG" ]; then
+  echo "Config not found: $CONFIG"
+  exit 1
+fi
+
+LABEL=$(jq -r '.label // "agent"' "$CONFIG")
+MAX_PARALLEL=$(jq -r '.max_parallel // 3' "$CONFIG")
+MAX_TURNS=$(jq -r '.max_turns // 15' "$CONFIG")
+MAX_CI_RETRIES=$(jq -r '.max_ci_retries // 3' "$CONFIG")
+MAX_REVIEW_FIX_ITERATIONS=$(jq -r '.max_review_fix_iterations // 3' "$CONFIG")
+
+# Global flags (set by CLI parsing)
+AUTO_REVIEW=false
+AUTO_FIX=false
+SEQUENCED=false
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+# --- Resolve ci-gate path ---
+
+resolve_ci_gate() {
+  # 1. Explicit config path
+  local CONFIG_PATH
+  CONFIG_PATH=$(jq -r '.ci_gate_path // empty' "$CONFIG")
+  if [ -n "$CONFIG_PATH" ] && [ -x "$CONFIG_PATH" ]; then
+    echo "$CONFIG_PATH"
+    return 0
+  fi
+
+  # 2. Sibling to this script (both in ~/.local/bin/ or same dir)
+  local SCRIPT_DIR
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ -x "$SCRIPT_DIR/ci-gate" ]; then
+    echo "$SCRIPT_DIR/ci-gate"
+    return 0
+  fi
+
+  # 3. PATH lookup
+  local PATH_CI
+  PATH_CI=$(command -v ci-gate 2>/dev/null)
+  if [ -n "$PATH_CI" ] && [ -x "$PATH_CI" ]; then
+    echo "$PATH_CI"
+    return 0
+  fi
+
+  echo ""
+}
+
+# --- Linear API helpers (all take API_KEY as first arg) ---
+
+linear_graphql() {
+  local API_KEY="$1"
+  local QUERY="$2"
+  curl -s -X POST https://api.linear.app/graphql \
+    -H "Content-Type: application/json" \
+    -H "Authorization: $API_KEY" \
+    -d "{\"query\": $(echo "$QUERY" | jq -Rs .)}"
+}
+
+linear_comment() {
+  local API_KEY="$1"
+  local ISSUE_ID="$2"
+  local BODY="$3"
+  linear_graphql "$API_KEY" "mutation { commentCreate(input: { issueId: \"$ISSUE_ID\", body: $(echo "$BODY" | jq -Rs .) }) { success comment { id } } }" \
+    | jq -r '.data.commentCreate.comment.id // empty'
+}
+
+linear_delete_comment() {
+  local API_KEY="$1"
+  local COMMENT_ID="$2"
+  linear_graphql "$API_KEY" "mutation { commentDelete(id: \"$COMMENT_ID\") { success } }" >/dev/null 2>&1
+}
+
+linear_set_state() {
+  local API_KEY="$1"
+  local ISSUE_ID="$2"
+  local STATE_NAME="$3"
+  local TEAM_ID="$4"
+
+  local STATE_ID
+  STATE_ID=$(linear_graphql "$API_KEY" "{ workflowStates(filter: { name: { eq: \"$STATE_NAME\" }, team: { id: { eq: \"$TEAM_ID\" } } }) { nodes { id name } } }" \
+    | jq -r '.data.workflowStates.nodes[0].id // empty')
+
+  if [ -n "$STATE_ID" ]; then
+    linear_graphql "$API_KEY" "mutation { issueUpdate(id: \"$ISSUE_ID\", input: { stateId: \"$STATE_ID\" }) { success } }"
+  fi
+}
+
+linear_get_comments() {
+  local API_KEY="$1"
+  local ISSUE_ID="$2"
+  linear_graphql "$API_KEY" "{ issue(id: \"$ISSUE_ID\") { comments { nodes { body createdAt user { name } } } } }" \
+    | jq -r '.data.issue.comments.nodes | sort_by(.createdAt) | .[] | "[\(.user.name // "system")] \(.body)"' 2>/dev/null
+}
+
+linear_remove_label() {
+  local API_KEY="$1"
+  local ISSUE_ID="$2"
+  local LABEL_ID="$3"
+
+  local CURRENT_LABELS
+  CURRENT_LABELS=$(linear_graphql "$API_KEY" "{ issue(id: \"$ISSUE_ID\") { labels { nodes { id } } } }" \
+    | jq -r "[.data.issue.labels.nodes[].id | select(. != \"$LABEL_ID\")] | join(\",\")")
+
+  local LABEL_ARRAY
+  if [ -z "$CURRENT_LABELS" ]; then
+    LABEL_ARRAY="[]"
+  else
+    LABEL_ARRAY=$(echo "$CURRENT_LABELS" | tr ',' '\n' | jq -R . | jq -s .)
+  fi
+
+  linear_graphql "$API_KEY" "mutation { issueUpdate(id: \"$ISSUE_ID\", input: { labelIds: $LABEL_ARRAY }) { success } }"
+}
+
+# --- GitHub PR feedback helpers ---
+
+gather_pr_feedback() {
+  local REPO_DIR="$1"
+  local BRANCH="$2"
+  local FEEDBACK=""
+
+  cd "$REPO_DIR" || return 0
+
+  # Check if a PR exists for this branch
+  local PR_NUMBER
+  PR_NUMBER=$(gh pr view "$BRANCH" --json number --jq '.number' 2>/dev/null) || return 0
+  [ -z "$PR_NUMBER" ] && return 0
+
+  local OWNER_REPO
+  OWNER_REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null) || return 0
+
+  # Top-level PR comments
+  local PR_COMMENTS
+  PR_COMMENTS=$(gh pr view "$BRANCH" --json comments --jq '.comments[] | "[\(.author.login)] \(.body)"' 2>/dev/null)
+  if [ -n "$PR_COMMENTS" ]; then
+    FEEDBACK="${FEEDBACK}## PR Comments
+${PR_COMMENTS}
+
+"
+  fi
+
+  # Review summaries
+  local REVIEWS
+  REVIEWS=$(gh pr view "$BRANCH" --json reviews --jq '.reviews[] | select(.body != "") | "[\(.author.login) - \(.state)] \(.body)"' 2>/dev/null)
+  if [ -n "$REVIEWS" ]; then
+    FEEDBACK="${FEEDBACK}## Review Summaries
+${REVIEWS}
+
+"
+  fi
+
+  # Inline file-level comments (review comments on specific lines)
+  local INLINE
+  INLINE=$(gh api "repos/${OWNER_REPO}/pulls/${PR_NUMBER}/comments" --jq '.[] | "[\(.user.login)] \(.path):\(.line // .original_line) — \(.body)"' 2>/dev/null)
+  if [ -n "$INLINE" ]; then
+    FEEDBACK="${FEEDBACK}## Inline Review Comments
+${INLINE}
+
+"
+  fi
+
+  echo "$FEEDBACK"
+}
+
+# --- Slack notification helper ---
+
+slack_notify() {
+  local WEBHOOK_URL="$1"
+  local MESSAGE="$2"
+  [ -z "$WEBHOOK_URL" ] && return 0
+  curl -s -X POST "$WEBHOOK_URL" -H 'Content-Type: application/json' \
+    -d "{\"text\": $(echo "$MESSAGE" | jq -Rs .)}" >/dev/null 2>&1 || true
+}
+
+# --- Resolve API key for a workspace ---
+
+resolve_api_key() {
+  local WORKSPACE="$1"
+
+  # Check for env var name in config
+  local ENV_VAR
+  ENV_VAR=$(jq -r ".workspaces[\"$WORKSPACE\"].api_key_env // empty" "$CONFIG")
+  if [ -n "$ENV_VAR" ]; then
+    local KEY="${!ENV_VAR:-}"
+    if [ -n "$KEY" ]; then
+      echo "$KEY"
+      return 0
+    fi
+    echo "WARNING: env var $ENV_VAR not set for workspace $WORKSPACE" >&2
+  fi
+
+  # Fallback: LINEAR_API_KEY_<WORKSPACE>
+  local AUTO_VAR="LINEAR_API_KEY_$(echo "$WORKSPACE" | tr '[:lower:]-' '[:upper:]_')"
+  local KEY="${!AUTO_VAR:-}"
+  if [ -n "$KEY" ]; then
+    echo "$KEY"
+    return 0
+  fi
+
+  # Last fallback: global LINEAR_API_KEY
+  if [ -n "${LINEAR_API_KEY:-}" ]; then
+    echo "$LINEAR_API_KEY"
+    return 0
+  fi
+
+  echo "ERROR: No API key found for workspace $WORKSPACE" >&2
+  echo "  Set one of: $ENV_VAR, $AUTO_VAR, or LINEAR_API_KEY" >&2
+  return 1
+}
+
+# --- Resolve Slack webhook for a workspace ---
+
+resolve_slack_webhook() {
+  local WORKSPACE="$1"
+
+  local ENV_VAR
+  ENV_VAR=$(jq -r ".workspaces[\"$WORKSPACE\"].slack_webhook_env // empty" "$CONFIG")
+  if [ -n "$ENV_VAR" ]; then
+    local URL="${!ENV_VAR:-}"
+    if [ -n "$URL" ]; then
+      echo "$URL"
+      return 0
+    fi
+  fi
+
+  local AUTO_VAR="SLACK_WEBHOOK_$(echo "$WORKSPACE" | tr '[:lower:]-' '[:upper:]_')"
+  local URL="${!AUTO_VAR:-}"
+  if [ -n "$URL" ]; then
+    echo "$URL"
+    return 0
+  fi
+
+  echo ""
+}
+
+# --- Docker-per-agent DB isolation ---
+
+start_agent_db() {
+  local WORKTREE="$1"
+  local IDENTIFIER="$2"
+  local REPO_DIR="$3"
+  local DB_TYPE="${4:-none}"
+
+  [ "$DB_TYPE" = "none" ] && return 0
+
+  local REPO_NAME
+  REPO_NAME=$(basename "$REPO_DIR")
+  local CONTAINER="agent-db-${IDENTIFIER}"
+
+  # On resume: check if container is already running
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; then
+    log "[$REPO_NAME] DB container $CONTAINER already running, reusing"
+    local EXISTING_PORT
+    EXISTING_PORT=$(docker port "$CONTAINER" 5432 2>/dev/null | head -1 | cut -d: -f2)
+    if [ -n "$EXISTING_PORT" ]; then
+      _write_db_env "$WORKTREE" "$EXISTING_PORT" "$DB_TYPE"
+    fi
+    return 0
+  fi
+
+  # Remove stopped container with same name if it exists
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+
+  log "[$REPO_NAME] Starting DB container for ${IDENTIFIER} (type: ${DB_TYPE})"
+
+  # Start postgres container with random ephemeral port
+  docker run -d \
+    --name "$CONTAINER" \
+    --label "claude-agent=true" \
+    -e POSTGRES_USER=postgres \
+    -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_DB=agent \
+    -p 0:5432 \
+    postgres:16-alpine >/dev/null 2>&1
+
+  if [ $? -ne 0 ]; then
+    log "[$REPO_NAME] WARNING: Failed to start DB container for ${IDENTIFIER}"
+    return 1
+  fi
+
+  # Read assigned port
+  local DB_PORT
+  DB_PORT=$(docker port "$CONTAINER" 5432 2>/dev/null | head -1 | cut -d: -f2)
+  if [ -z "$DB_PORT" ]; then
+    log "[$REPO_NAME] WARNING: Could not determine DB port for ${IDENTIFIER}"
+    docker rm -f "$CONTAINER" >/dev/null 2>&1
+    return 1
+  fi
+
+  # Wait for pg_isready (max 30s)
+  local WAITED=0
+  while [ $WAITED -lt 30 ]; do
+    if docker exec "$CONTAINER" pg_isready -U postgres >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+    WAITED=$((WAITED + 1))
+  done
+
+  if [ $WAITED -ge 30 ]; then
+    log "[$REPO_NAME] WARNING: DB container for ${IDENTIFIER} not ready after 30s"
+    docker rm -f "$CONTAINER" >/dev/null 2>&1
+    return 1
+  fi
+
+  # Run migrations if present
+  local MIGRATION_DIR=""
+  if [ -d "$REPO_DIR/supabase/migrations" ]; then
+    MIGRATION_DIR="$REPO_DIR/supabase/migrations"
+  elif [ -d "$REPO_DIR/migrations" ]; then
+    MIGRATION_DIR="$REPO_DIR/migrations"
+  fi
+
+  if [ -n "$MIGRATION_DIR" ]; then
+    log "[$REPO_NAME] Running migrations from $MIGRATION_DIR"
+    for sql_file in "$MIGRATION_DIR"/*.sql; do
+      [ -f "$sql_file" ] || continue
+      docker exec -i "$CONTAINER" psql -U postgres -d agent < "$sql_file" >/dev/null 2>&1 || {
+        log "[$REPO_NAME] WARNING: Migration failed: $(basename "$sql_file")"
+      }
+    done
+  fi
+
+  _write_db_env "$WORKTREE" "$DB_PORT" "$DB_TYPE"
+  log "[$REPO_NAME] DB running for ${IDENTIFIER} on port ${DB_PORT}"
+  return 0
+}
+
+_write_db_env() {
+  local WORKTREE="$1"
+  local DB_PORT="$2"
+  local DB_TYPE="$3"
+
+  local DB_URL="postgresql://postgres:postgres@localhost:${DB_PORT}/agent"
+
+  # Strip existing DB env vars if .env.local exists
+  if [ -f "$WORKTREE/.env.local" ]; then
+    grep -v '^DATABASE_URL=' "$WORKTREE/.env.local" \
+      | grep -v '^DIRECT_URL=' \
+      | grep -v '^NEXT_PUBLIC_SUPABASE_URL=' \
+      | grep -v '^SUPABASE_DB_URL=' \
+      > "$WORKTREE/.env.local.tmp" || true
+    mv "$WORKTREE/.env.local.tmp" "$WORKTREE/.env.local"
+  fi
+
+  echo "DATABASE_URL=${DB_URL}" >> "$WORKTREE/.env.local"
+  echo "DIRECT_URL=${DB_URL}" >> "$WORKTREE/.env.local"
+
+  if [ "$DB_TYPE" = "supabase" ]; then
+    echo "NEXT_PUBLIC_SUPABASE_URL=http://localhost:${DB_PORT}" >> "$WORKTREE/.env.local"
+    echo "SUPABASE_DB_URL=${DB_URL}" >> "$WORKTREE/.env.local"
+  fi
+}
+
+stop_agent_db() {
+  local IDENTIFIER="$1"
+  local CONTAINER="agent-db-${IDENTIFIER}"
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+}
+
+cleanup_agent_dbs() {
+  # Remove stopped containers with claude-agent label
+  local STOPPED
+  STOPPED=$(docker ps -a --filter "label=claude-agent=true" --filter "status=exited" --format '{{.Names}}' 2>/dev/null)
+  if [ -n "$STOPPED" ]; then
+    echo "$STOPPED" | while read -r name; do
+      docker rm -f "$name" >/dev/null 2>&1
+      log "Cleaned up stopped DB container: $name"
+    done
+  fi
+}
+
+# --- Fetch issues labeled "agent" for a team ---
+
+fetch_agent_issues() {
+  local API_KEY="$1"
+  local TEAM_NAME="$2"
+  local LIMIT="$3"
+
+  local QUERY
+  if [ "$SEQUENCED" = true ]; then
+    # Include relations to check for blockers
+    QUERY="{
+      issues(
+        filter: {
+          team: { name: { eq: \"$TEAM_NAME\" } }
+          labels: { name: { eq: \"$LABEL\" } }
+          state: { type: { nin: [\"completed\", \"canceled\"] } }
+        }
+        first: $LIMIT
+      ) {
+        nodes {
+          id
+          identifier
+          title
+          description
+          team { id name }
+          labels { nodes { id name } }
+          relations {
+            nodes {
+              type
+              relatedIssue {
+                id
+                identifier
+                state { type }
+              }
+            }
+          }
+        }
+      }
+    }"
+  else
+    QUERY="{
+      issues(
+        filter: {
+          team: { name: { eq: \"$TEAM_NAME\" } }
+          labels: { name: { eq: \"$LABEL\" } }
+          state: { type: { nin: [\"completed\", \"canceled\"] } }
+        }
+        first: $LIMIT
+      ) {
+        nodes {
+          id
+          identifier
+          title
+          description
+          team { id name }
+          labels { nodes { id name } }
+        }
+      }
+    }"
+  fi
+
+  local RESULT
+  RESULT=$(linear_graphql "$API_KEY" "$QUERY" | jq '.data.issues.nodes // []')
+
+  if [ "$SEQUENCED" = true ]; then
+    # Filter out issues that have incomplete blockers
+    echo "$RESULT" | jq '[.[] | select(
+      ([.relations.nodes[]? | select(.type == "isBlockedBy") | .relatedIssue.state.type] |
+       map(select(. != "completed" and . != "canceled")) | length) == 0
+    )]'
+  else
+    echo "$RESULT"
+  fi
+}
+
+# --- Worktree management ---
+
+cleanup_worktrees() {
+  local REPO_DIR="$1"
+  local REPO_NAME
+  REPO_NAME=$(basename "$REPO_DIR")
+  cd "$REPO_DIR" || return 1
+
+  local WORKTREE_BASE="$HOME/.claude/worktrees/${REPO_NAME}"
+  local CLEANED=0
+  if [ -d "$WORKTREE_BASE" ]; then
+    for wt in "$WORKTREE_BASE"/issue-*; do
+      [ -d "$wt" ] || continue
+      local ISSUE_ID
+      ISSUE_ID=$(basename "$wt" | sed 's/issue-//')
+
+      local PR_STATE
+      PR_STATE=$(gh pr list --head "agent/${ISSUE_ID}" --state all --json state --jq '.[0].state // "none"' 2>/dev/null)
+
+      if [ "$PR_STATE" = "MERGED" ] || [ "$PR_STATE" = "CLOSED" ]; then
+        log "[$REPO_NAME] Cleaning up worktree for ${ISSUE_ID} (PR ${PR_STATE})"
+
+        # Stop DB container if running
+        stop_agent_db "$ISSUE_ID"
+
+        git worktree remove "$wt" --force 2>/dev/null || true
+        git branch -D "agent/${ISSUE_ID}" 2>/dev/null || true
+        CLEANED=$((CLEANED + 1))
+      fi
+    done
+  fi
+
+  git worktree prune 2>/dev/null || true
+  cleanup_agent_dbs
+  [ "$CLEANED" -gt 0 ] && log "[$REPO_NAME] Cleaned $CLEANED worktrees"
+}
+
+show_status() {
+  echo "=== Claude Agent Runner Status ==="
+  echo ""
+
+  local WORKSPACES
+  WORKSPACES=$(jq -r '.workspaces | keys[]' "$CONFIG")
+
+  while IFS= read -r WS; do
+    echo "Workspace: $WS"
+
+    local API_KEY
+    API_KEY=$(resolve_api_key "$WS" 2>/dev/null) || { echo "  No API key configured"; echo ""; continue; }
+
+    local TEAMS
+    TEAMS=$(jq -r ".workspaces[\"$WS\"].teams | to_entries[] | \"\(.key)|\(.value.repo)|\(.value.local_db // \"none\")\"" "$CONFIG")
+
+    while IFS='|' read -r TEAM_NAME REPO_DIR LOCAL_DB; do
+      local REPO_NAME
+      REPO_NAME=$(basename "$REPO_DIR")
+      echo "  Team: $TEAM_NAME → $REPO_NAME (db: ${LOCAL_DB})"
+
+      local ACTIVE=0
+      local WT_BASE="$HOME/.claude/worktrees/$(basename "$REPO_DIR")"
+      if [ -d "$WT_BASE" ]; then
+        for wt in "$WT_BASE"/issue-*; do
+          [ -d "$wt" ] || continue
+          local ID
+          ID=$(basename "$wt" | sed 's/issue-//')
+          echo "    Active: $ID"
+          ACTIVE=$((ACTIVE + 1))
+        done
+      fi
+      [ "$ACTIVE" -eq 0 ] && echo "    No active agents"
+
+      local PENDING
+      PENDING=$(fetch_agent_issues "$API_KEY" "$TEAM_NAME" 10 | jq length)
+      echo "    Pending: $PENDING issues labeled '$LABEL'"
+    done <<< "$TEAMS"
+    echo ""
+  done <<< "$WORKSPACES"
+}
+
+# --- Auto-review agent (Feature 2) ---
+
+auto_review_pr() {
+  local REPO_DIR="$1"
+  local BRANCH="$2"
+  local IDENTIFIER="$3"
+
+  cd "$REPO_DIR" || return 1
+
+  local PR_NUMBER
+  PR_NUMBER=$(gh pr view "$BRANCH" --json number --jq '.number' 2>/dev/null) || return 1
+  [ -z "$PR_NUMBER" ] && return 1
+
+  log "[review] Reviewing PR #${PR_NUMBER} for ${IDENTIFIER}"
+
+  # Get the full diff
+  local DIFF
+  DIFF=$(gh pr diff "$BRANCH" 2>/dev/null)
+  [ -z "$DIFF" ] && { log "[review] No diff found for PR #${PR_NUMBER}"; return 1; }
+
+  # Get PR info
+  local PR_TITLE PR_BODY
+  PR_TITLE=$(gh pr view "$BRANCH" --json title --jq '.title' 2>/dev/null)
+  PR_BODY=$(gh pr view "$BRANCH" --json body --jq '.body' 2>/dev/null)
+
+  # Create a temp file for the review prompt
+  local REVIEW_PROMPT
+  REVIEW_PROMPT=$(mktemp)
+  cat > "$REVIEW_PROMPT" << REVIEW_EOF
+You are a senior code reviewer. Review this PR thoroughly.
+
+## PR: ${PR_TITLE}
+
+### Description
+${PR_BODY}
+
+### Diff
+\`\`\`diff
+${DIFF}
+\`\`\`
+
+## Your task
+Review the code and output ONLY a JSON object with this exact structure:
+{
+  "verdict": "approve" | "request_changes" | "comment",
+  "summary": "1-2 sentence overall assessment",
+  "blocking": ["list of issues that MUST be fixed before merge"],
+  "important": ["list of issues that SHOULD be fixed"],
+  "nits": ["minor style/preference suggestions"],
+  "praise": ["things done well"]
+}
+
+Rules:
+- Only use "request_changes" for genuine bugs, security issues, or broken functionality
+- Style preferences and minor improvements should be "nits" or "important", not blocking
+- Be specific — reference file names and line numbers
+- Output ONLY the JSON, no markdown fences, no extra text
+REVIEW_EOF
+
+  # Spawn Claude in plan mode (read-only) for the review
+  local REVIEW_OUTPUT
+  REVIEW_OUTPUT=$(claude --permission-mode plan --print -p "$(cat "$REVIEW_PROMPT")" --max-turns 20 2>/dev/null)
+  rm -f "$REVIEW_PROMPT"
+
+  if [ -z "$REVIEW_OUTPUT" ]; then
+    log "[review] Claude returned empty output for PR #${PR_NUMBER}"
+    return 1
+  fi
+
+  # Try to parse as JSON
+  local VERDICT SUMMARY REVIEW_BODY
+  VERDICT=$(echo "$REVIEW_OUTPUT" | jq -r '.verdict // empty' 2>/dev/null)
+
+  if [ -n "$VERDICT" ]; then
+    SUMMARY=$(echo "$REVIEW_OUTPUT" | jq -r '.summary // ""' 2>/dev/null)
+    local BLOCKING IMPORTANT NITS PRAISE
+    BLOCKING=$(echo "$REVIEW_OUTPUT" | jq -r '.blocking // [] | map("- **BLOCKING**: " + .) | join("\n")' 2>/dev/null)
+    IMPORTANT=$(echo "$REVIEW_OUTPUT" | jq -r '.important // [] | map("- **Important**: " + .) | join("\n")' 2>/dev/null)
+    NITS=$(echo "$REVIEW_OUTPUT" | jq -r '.nits // [] | map("- _Nit_: " + .) | join("\n")' 2>/dev/null)
+    PRAISE=$(echo "$REVIEW_OUTPUT" | jq -r '.praise // [] | map("- :thumbsup: " + .) | join("\n")' 2>/dev/null)
+
+    REVIEW_BODY="## Auto-Review: ${SUMMARY}
+
+${BLOCKING}
+${IMPORTANT}
+${NITS}
+${PRAISE}
+
+---
+_Automated review by claude-agent-runner_"
+
+    # Post review via gh
+    case "$VERDICT" in
+      approve)
+        gh pr review "$PR_NUMBER" --approve --body "$REVIEW_BODY" 2>/dev/null
+        log "[review] PR #${PR_NUMBER} APPROVED"
+        ;;
+      request_changes)
+        gh pr review "$PR_NUMBER" --request-changes --body "$REVIEW_BODY" 2>/dev/null
+        log "[review] PR #${PR_NUMBER} CHANGES REQUESTED"
+        ;;
+      *)
+        gh pr review "$PR_NUMBER" --comment --body "$REVIEW_BODY" 2>/dev/null
+        log "[review] PR #${PR_NUMBER} COMMENTED"
+        ;;
+    esac
+  else
+    # Non-JSON output — post as plain comment
+    gh pr review "$PR_NUMBER" --comment --body "## Auto-Review
+
+${REVIEW_OUTPUT}
+
+---
+_Automated review by claude-agent-runner_" 2>/dev/null
+    VERDICT="comment"
+    log "[review] PR #${PR_NUMBER} commented (non-JSON output)"
+  fi
+
+  echo "$VERDICT"
+}
+
+# --- Auto-fix loop (Feature 3) ---
+
+auto_fix_loop() {
+  local WORKTREE="$1"
+  local REPO_DIR="$2"
+  local BRANCH="$3"
+  local IDENTIFIER="$4"
+  local REPO_NAME="$5"
+
+  cd "$WORKTREE" || return 1
+
+  local CI_GATE
+  CI_GATE=$(resolve_ci_gate)
+
+  for ITER in $(seq 1 "$MAX_REVIEW_FIX_ITERATIONS"); do
+    log "[auto-fix] Iteration ${ITER}/${MAX_REVIEW_FIX_ITERATIONS} for ${IDENTIFIER}"
+
+    # Check latest review verdict
+    local LATEST_REVIEW_STATE
+    LATEST_REVIEW_STATE=$(cd "$REPO_DIR" && gh pr view "$BRANCH" --json reviews --jq '[.reviews[] | select(.state != "")] | last | .state // "NONE"' 2>/dev/null)
+
+    if [ "$LATEST_REVIEW_STATE" = "APPROVED" ]; then
+      log "[auto-fix] PR already approved, stopping fix loop"
+      return 0
+    fi
+
+    if [ "$LATEST_REVIEW_STATE" != "CHANGES_REQUESTED" ]; then
+      log "[auto-fix] No changes requested (state: ${LATEST_REVIEW_STATE}), stopping fix loop"
+      return 0
+    fi
+
+    # Gather all feedback
+    local PR_FEEDBACK
+    PR_FEEDBACK=$(gather_pr_feedback "$REPO_DIR" "$BRANCH")
+
+    if [ -z "$PR_FEEDBACK" ]; then
+      log "[auto-fix] No feedback to address, stopping"
+      return 0
+    fi
+
+    # Spawn fix agent
+    cd "$WORKTREE" || return 1
+
+    # Export CLAUDE_AGENT_MODE for guardrail hook
+    export CLAUDE_AGENT_MODE=1
+
+    claude --permission-mode bypassPermissions --setting-sources project,local -p "You are working in an isolated git worktree for the ${REPO_NAME} project.
+Read CLAUDE.md for all project conventions.
+
+## Fix PR Feedback: ${IDENTIFIER}
+
+Address ALL reviewer feedback below. Make new, atomic commits for each fix.
+Do NOT amend existing commits or force-push.
+Do NOT push or open a PR — that is handled externally.
+
+${PR_FEEDBACK}
+
+Fix every issue mentioned above." --max-turns 500 >> "$LOG_DIR/${IDENTIFIER}-fix-${ITER}.log" 2>&1
+
+    unset CLAUDE_AGENT_MODE
+
+    # Run CI gate
+    if [ -n "$CI_GATE" ] && [ -x "$CI_GATE" ]; then
+      if ! "$CI_GATE" "$WORKTREE" >> "$LOG_DIR/${IDENTIFIER}-fix-ci-${ITER}.log" 2>&1; then
+        log "[auto-fix] CI failed after fix iteration ${ITER}"
+        # One CI retry within the fix
+        claude --permission-mode bypassPermissions --setting-sources project,local -p "CI gate failed after fixing PR feedback. Fix the CI errors:
+
+$(cat "$LOG_DIR/${IDENTIFIER}-fix-ci-${ITER}.log" | tail -50)
+
+Make new commits. Do NOT push." --max-turns 200 >> "$LOG_DIR/${IDENTIFIER}-fix-ci-retry-${ITER}.log" 2>&1
+
+        if ! "$CI_GATE" "$WORKTREE" >/dev/null 2>&1; then
+          log "[auto-fix] CI still failing after retry, bailing out of fix loop"
+          return 1
+        fi
+      fi
+    fi
+
+    # Push new commits
+    cd "$WORKTREE" || return 1
+    git push origin "$BRANCH" 2>&1
+
+    # Re-run auto-review
+    local NEW_VERDICT
+    NEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER")
+
+    if [ "$NEW_VERDICT" = "approve" ]; then
+      log "[auto-fix] PR approved after fix iteration ${ITER}"
+      return 0
+    fi
+
+    log "[auto-fix] Review verdict after fix ${ITER}: ${NEW_VERDICT}"
+  done
+
+  log "[auto-fix] Exhausted ${MAX_REVIEW_FIX_ITERATIONS} fix iterations for ${IDENTIFIER}"
+  return 1
+}
+
+# --- Pipeline command (Feature 1) ---
+
+run_pipeline() {
+  local REQUIREMENTS_FILE="$1"
+  local WORKSPACE="${2:-}"
+  local TEAM_NAME="${3:-}"
+  local DRY_RUN="${4:-false}"
+
+  if [ ! -f "$REQUIREMENTS_FILE" ]; then
+    echo "ERROR: Requirements file not found: $REQUIREMENTS_FILE"
+    exit 1
+  fi
+
+  local REQUIREMENTS
+  REQUIREMENTS=$(cat "$REQUIREMENTS_FILE")
+
+  # Default to first workspace/team if not specified
+  if [ -z "$WORKSPACE" ]; then
+    WORKSPACE=$(jq -r '.workspaces | keys[0]' "$CONFIG")
+  fi
+  if [ -z "$TEAM_NAME" ]; then
+    TEAM_NAME=$(jq -r ".workspaces[\"$WORKSPACE\"].teams | keys[0]" "$CONFIG")
+  fi
+
+  local API_KEY
+  API_KEY=$(resolve_api_key "$WORKSPACE") || exit 1
+
+  log "Parsing requirements into stories..."
+
+  # Spawn Claude to parse requirements into structured JSON
+  local PARSE_OUTPUT
+  PARSE_OUTPUT=$(claude --print --max-turns 3 --output-format json -p "Parse the following product requirements into structured development stories.
+
+Output ONLY a JSON array with this structure:
+[
+  {
+    \"title\": \"Short imperative title (e.g., 'Add user authentication')\",
+    \"description\": \"Detailed description with acceptance criteria\",
+    \"estimate\": 1,
+    \"labels\": [\"feature\"],
+    \"dependencies\": []
+  }
+]
+
+Rules:
+- estimate is in story points (1=trivial, 2=small, 3=medium, 5=large, 8=very large)
+- labels: use 'feature', 'bug', 'chore', 'improvement'
+- dependencies: list titles of other stories this one depends on (must complete first)
+- Break large requirements into small, independent stories
+- Each story should be completable in one agent session (1-3 hours of work)
+- Output ONLY the JSON array, nothing else
+
+## Requirements
+
+${REQUIREMENTS}" 2>/dev/null)
+
+  if [ -z "$PARSE_OUTPUT" ]; then
+    echo "ERROR: Claude returned empty output while parsing requirements"
+    exit 1
+  fi
+
+  # Validate JSON
+  if ! echo "$PARSE_OUTPUT" | jq empty 2>/dev/null; then
+    echo "ERROR: Claude returned invalid JSON:"
+    echo "$PARSE_OUTPUT"
+    exit 1
+  fi
+
+  local STORY_COUNT
+  STORY_COUNT=$(echo "$PARSE_OUTPUT" | jq length)
+  log "Parsed $STORY_COUNT stories"
+
+  # Dry run — just print
+  if [ "$DRY_RUN" = true ]; then
+    echo ""
+    echo "=== Pipeline Dry Run ==="
+    echo "Workspace: $WORKSPACE | Team: $TEAM_NAME"
+    echo "Stories: $STORY_COUNT"
+    echo ""
+    echo "$PARSE_OUTPUT" | jq -r '.[] | "[\(.estimate)pt] \(.title)\n  Labels: \(.labels | join(", "))\n  Deps: \(.dependencies | if length > 0 then join(", ") else "none" end)\n  \(.description)\n"'
+    return 0
+  fi
+
+  # Get team ID
+  local TEAM_ID
+  TEAM_ID=$(linear_graphql "$API_KEY" "{ teams(filter: { name: { eq: \"$TEAM_NAME\" } }) { nodes { id } } }" \
+    | jq -r '.data.teams.nodes[0].id // empty')
+
+  if [ -z "$TEAM_ID" ]; then
+    echo "ERROR: Team '$TEAM_NAME' not found in Linear"
+    exit 1
+  fi
+
+  # Get label ID for the agent label
+  local AGENT_LABEL_ID
+  AGENT_LABEL_ID=$(linear_graphql "$API_KEY" "{ issueLabels(filter: { name: { eq: \"$LABEL\" } }) { nodes { id } } }" \
+    | jq -r '.data.issueLabels.nodes[0].id // empty')
+
+  if [ -z "$AGENT_LABEL_ID" ]; then
+    echo "WARNING: Label '$LABEL' not found in Linear — issues will be created without it"
+  fi
+
+  # Create issues
+  log "Creating $STORY_COUNT Linear issues..."
+
+  # Map title -> issue ID for dependency resolution
+  declare -A TITLE_TO_ID
+
+  echo "$PARSE_OUTPUT" | jq -c '.[]' | while read -r story; do
+    local STORY_TITLE STORY_DESC STORY_ESTIMATE
+    STORY_TITLE=$(echo "$story" | jq -r '.title')
+    STORY_DESC=$(echo "$story" | jq -r '.description')
+    STORY_ESTIMATE=$(echo "$story" | jq -r '.estimate // 0')
+
+    local LABEL_IDS=""
+    if [ -n "$AGENT_LABEL_ID" ]; then
+      # Check if this story has dependencies and --sequenced is set
+      local HAS_DEPS
+      HAS_DEPS=$(echo "$story" | jq -r '.dependencies | length')
+
+      if [ "$SEQUENCED" = true ] && [ "$HAS_DEPS" -gt 0 ]; then
+        # Don't add agent label — will be added when blockers complete
+        LABEL_IDS="[]"
+      else
+        LABEL_IDS="[\"$AGENT_LABEL_ID\"]"
+      fi
+    else
+      LABEL_IDS="[]"
+    fi
+
+    local CREATE_RESULT
+    CREATE_RESULT=$(linear_graphql "$API_KEY" "mutation {
+      issueCreate(input: {
+        teamId: \"$TEAM_ID\"
+        title: $(echo "$STORY_TITLE" | jq -Rs .)
+        description: $(echo "$STORY_DESC" | jq -Rs .)
+        estimate: $STORY_ESTIMATE
+        labelIds: $LABEL_IDS
+      }) {
+        success
+        issue { id identifier }
+      }
+    }")
+
+    local NEW_ID NEW_IDENT
+    NEW_ID=$(echo "$CREATE_RESULT" | jq -r '.data.issueCreate.issue.id // empty')
+    NEW_IDENT=$(echo "$CREATE_RESULT" | jq -r '.data.issueCreate.issue.identifier // empty')
+
+    if [ -n "$NEW_ID" ]; then
+      log "Created: ${NEW_IDENT} — ${STORY_TITLE}"
+      TITLE_TO_ID["$STORY_TITLE"]="$NEW_ID"
+    else
+      log "ERROR: Failed to create issue: ${STORY_TITLE}"
+    fi
+  done
+
+  # Create dependency relations (second pass)
+  echo "$PARSE_OUTPUT" | jq -c '.[]' | while read -r story; do
+    local STORY_TITLE
+    STORY_TITLE=$(echo "$story" | jq -r '.title')
+    local DEPS
+    DEPS=$(echo "$story" | jq -r '.dependencies[]?' 2>/dev/null)
+
+    [ -z "$DEPS" ] && continue
+
+    local THIS_ID="${TITLE_TO_ID[$STORY_TITLE]:-}"
+    [ -z "$THIS_ID" ] && continue
+
+    while IFS= read -r dep_title; do
+      local BLOCKER_ID="${TITLE_TO_ID[$dep_title]:-}"
+      if [ -n "$BLOCKER_ID" ]; then
+        linear_graphql "$API_KEY" "mutation {
+          issueRelationCreate(input: {
+            issueId: \"$THIS_ID\"
+            relatedIssueId: \"$BLOCKER_ID\"
+            type: \"isBlockedBy\"
+          }) { success }
+        }" >/dev/null 2>&1
+        log "  Linked: ${STORY_TITLE} blocked by ${dep_title}"
+      fi
+    done <<< "$DEPS"
+  done
+
+  log "Pipeline complete — $STORY_COUNT issues created in ${WORKSPACE}/${TEAM_NAME}"
+}
+
+# --- Main agent loop ---
+
+run_agents_for_team() {
+  local API_KEY="$1"
+  local WORKSPACE="$2"
+  local TEAM_NAME="$3"
+  local REPO_DIR="$4"
+  local LOCAL_DB="${5:-none}"
+  local REPO_NAME
+  REPO_NAME=$(basename "$REPO_DIR")
+  local SLACK_WEBHOOK
+  SLACK_WEBHOOK=$(resolve_slack_webhook "$WORKSPACE")
+
+  # Lock per repo
+  local LOCK_FILE="$LOCK_DIR/${REPO_NAME}.lock"
+  if [ -f "$LOCK_FILE" ]; then
+    local LOCK_PID
+    LOCK_PID=$(cat "$LOCK_FILE")
+    if kill -0 "$LOCK_PID" 2>/dev/null; then
+      log "[$WORKSPACE/$TEAM_NAME] Already running (PID $LOCK_PID), skipping"
+      return 0
+    else
+      rm -f "$LOCK_FILE"
+    fi
+  fi
+  echo $$ > "$LOCK_FILE"
+
+  cd "$REPO_DIR" || { log "[$WORKSPACE/$TEAM_NAME] Repo not found: $REPO_DIR"; rm -f "$LOCK_FILE"; return 1; }
+
+  cleanup_worktrees "$REPO_DIR"
+
+  # Count active slots
+  local ACTIVE=0
+  local WT_BASE="$HOME/.claude/worktrees/${REPO_NAME}"
+  if [ -d "$WT_BASE" ]; then
+    for wt in "$WT_BASE"/issue-*; do
+      [ -d "$wt" ] && ACTIVE=$((ACTIVE + 1))
+    done
+  fi
+
+  local SLOTS=$((MAX_PARALLEL - ACTIVE))
+  if [ "$SLOTS" -le 0 ]; then
+    log "[$WORKSPACE/$TEAM_NAME] All $MAX_PARALLEL slots in use"
+    rm -f "$LOCK_FILE"
+    return 0
+  fi
+
+  # Fetch issues from Linear
+  local ISSUES
+  ISSUES=$(fetch_agent_issues "$API_KEY" "$TEAM_NAME" "$SLOTS")
+  local COUNT
+  COUNT=$(echo "$ISSUES" | jq length)
+
+  if [ "$COUNT" -eq 0 ]; then
+    log "[$WORKSPACE/$TEAM_NAME] No '$LABEL' issues"
+    rm -f "$LOCK_FILE"
+    return 0
+  fi
+
+  log "[$WORKSPACE/$TEAM_NAME] Found $COUNT issues, $SLOTS slots available"
+
+  # Get the label ID for removal
+  local LABEL_ID
+  LABEL_ID=$(echo "$ISSUES" | jq -r ".[0].labels.nodes[] | select(.name == \"$LABEL\") | .id" 2>/dev/null)
+
+  # Resolve ci-gate path once
+  local CI_GATE
+  CI_GATE=$(resolve_ci_gate)
+
+  echo "$ISSUES" | jq -c '.[]' | while read -r issue; do
+    local ISSUE_ID IDENTIFIER TITLE DESCRIPTION TEAM_ID BRANCH WORKTREE
+    ISSUE_ID=$(echo "$issue" | jq -r '.id')
+    IDENTIFIER=$(echo "$issue" | jq -r '.identifier')
+    TITLE=$(echo "$issue" | jq -r '.title')
+    DESCRIPTION=$(echo "$issue" | jq -r '.description // ""')
+    TEAM_ID=$(echo "$issue" | jq -r '.team.id')
+
+    BRANCH="agent/${IDENTIFIER}"
+    WORKTREE_BASE="$HOME/.claude/worktrees/${REPO_NAME}"
+    mkdir -p "$WORKTREE_BASE"
+    WORKTREE="$WORKTREE_BASE/issue-${IDENTIFIER}"
+
+    RESUMING=false
+    RESUME_REASON=""
+    if [ -d "$WORKTREE" ]; then
+      BLOCKED_FILE="$WORKTREE/.claude/agent-blocked/${IDENTIFIER}.md"
+      if [ -f "$BLOCKED_FILE" ]; then
+        RESUMING=true
+        RESUME_REASON="blocked"
+        log "[$WORKSPACE/$TEAM_NAME] Resuming ${IDENTIFIER} (previously blocked)"
+        rm -f "$BLOCKED_FILE"
+      else
+        RESUMING=true
+        RESUME_REASON="feedback"
+        log "[$WORKSPACE/$TEAM_NAME] Resuming ${IDENTIFIER} (feedback on existing PR)"
+      fi
+    else
+      git fetch origin main 2>/dev/null || true
+      git worktree add "$WORKTREE" -b "$BRANCH" origin/main 2>/dev/null || {
+        log "[$WORKSPACE/$TEAM_NAME] Failed to create worktree for ${IDENTIFIER}"
+        linear_comment "$API_KEY" "$ISSUE_ID" "❌ **Agent failed** — could not create worktree" >/dev/null 2>&1
+        continue
+      }
+
+      [ -f ".env" ] && cp .env "$WORKTREE/.env"
+      [ -f ".env.local" ] && cp .env.local "$WORKTREE/.env.local"
+    fi
+
+    # --- Linear: In Progress ---
+    linear_set_state "$API_KEY" "$ISSUE_ID" "In Progress" "$TEAM_ID" >/dev/null 2>&1
+    linear_remove_label "$API_KEY" "$ISSUE_ID" "$LABEL_ID" >/dev/null 2>&1
+
+    # Start DB container if configured
+    if [ "$LOCAL_DB" != "none" ]; then
+      start_agent_db "$WORKTREE" "$IDENTIFIER" "$REPO_DIR" "$LOCAL_DB"
+    fi
+
+    local ISSUE_LOG="$LOG_DIR/${WORKSPACE}-${IDENTIFIER}.log"
+
+    (
+      cd "$WORKTREE"
+
+      # Export CLAUDE_AGENT_MODE for guardrail hook
+      export CLAUDE_AGENT_MODE=1
+
+      # Track transient Linear comment IDs for cleanup
+      TRANSIENT_COMMENTS_FILE="$LOG_DIR/${WORKSPACE}-${IDENTIFIER}-comments.tmp"
+      : > "$TRANSIENT_COMMENTS_FILE"
+
+      post_status() {
+        local CID
+        CID=$(linear_comment "$API_KEY" "$ISSUE_ID" "$1")
+        if [ -n "$CID" ]; then
+          echo "$CID" >> "$TRANSIENT_COMMENTS_FILE"
+        fi
+      }
+
+      cleanup_status_comments() {
+        if [ -f "$TRANSIENT_COMMENTS_FILE" ]; then
+          while IFS= read -r CID; do
+            [ -n "$CID" ] && linear_delete_comment "$API_KEY" "$CID"
+          done < "$TRANSIENT_COMMENTS_FILE"
+          rm -f "$TRANSIENT_COMMENTS_FILE"
+        fi
+      }
+
+      # Install dependencies (skip on resume)
+      if [ "$RESUMING" != true ]; then
+        if [ -f "pnpm-lock.yaml" ]; then
+          pnpm install --frozen-lockfile 2>/dev/null || pnpm install 2>/dev/null
+        fi
+        if [ -f "dashboard/pnpm-lock.yaml" ]; then
+          (cd dashboard && pnpm install --frozen-lockfile 2>/dev/null || pnpm install 2>/dev/null)
+        fi
+      fi
+
+      # Unset CLAUDECODE to allow spawning Claude from within a Claude session
+      unset CLAUDECODE 2>/dev/null || true
+
+      # Session ID file for resume support
+      SESSION_FILE="$LOG_DIR/${WORKSPACE}-${IDENTIFIER}-session.id"
+
+      if [ "$RESUMING" = true ]; then
+        PREV_SESSION=$(cat "$SESSION_FILE" 2>/dev/null || echo "")
+
+        if [ "$RESUME_REASON" = "blocked" ]; then
+          COMMENTS=$(linear_get_comments "$API_KEY" "$ISSUE_ID")
+          post_status "🔄 **Agent resuming** — developer responded, continuing work"
+          slack_notify "$SLACK_WEBHOOK" "🔄 [${WORKSPACE}/${TEAM_NAME}] Agent resuming ${IDENTIFIER} — developer responded to blocked question"
+
+          if [ -n "$PREV_SESSION" ]; then
+            claude --permission-mode bypassPermissions --setting-sources project,local -r "$PREV_SESSION" -p "The developer has responded to your question. Here are the latest comments from Linear:
+
+${COMMENTS}
+
+Continue implementing ${IDENTIFIER}: ${TITLE}
+Remember: do NOT push or open a PR. Just implement, test, and commit.
+If you are still blocked, create .claude/agent-blocked/${IDENTIFIER}.md again." --max-turns 500
+          else
+            RESUMING=false
+          fi
+
+        elif [ "$RESUME_REASON" = "feedback" ]; then
+          COMMENTS=$(linear_get_comments "$API_KEY" "$ISSUE_ID")
+          PR_FEEDBACK=$(gather_pr_feedback "$REPO_DIR" "$BRANCH")
+          post_status "🔄 **Agent resuming** — addressing reviewer feedback"
+          slack_notify "$SLACK_WEBHOOK" "🔄 [${WORKSPACE}/${TEAM_NAME}] Agent resuming ${IDENTIFIER} — addressing PR/Linear feedback"
+
+          FEEDBACK_PROMPT="You are working in an isolated git worktree for the ${REPO_NAME} project.
+Read CLAUDE.md for all project conventions.
+
+## Feedback Resume: ${IDENTIFIER} — ${TITLE}
+
+Reviewers have left feedback on your PR and/or the Linear ticket. Address ALL feedback below with new commits.
+Do NOT amend existing commits or force-push. Make new, atomic commits for each fix.
+Do NOT push or open a PR — that is handled externally.
+
+"
+          if [ -n "$PR_FEEDBACK" ]; then
+            FEEDBACK_PROMPT="${FEEDBACK_PROMPT}## GitHub PR Feedback
+${PR_FEEDBACK}
+"
+          fi
+
+          if [ -n "$COMMENTS" ]; then
+            FEEDBACK_PROMPT="${FEEDBACK_PROMPT}## Linear Ticket Comments
+${COMMENTS}
+"
+          fi
+
+          FEEDBACK_PROMPT="${FEEDBACK_PROMPT}
+Address every piece of feedback above. If something is unclear, create .claude/agent-blocked/${IDENTIFIER}.md with your questions."
+
+          if [ -n "$PREV_SESSION" ]; then
+            claude --permission-mode bypassPermissions --setting-sources project,local -r "$PREV_SESSION" -p "$FEEDBACK_PROMPT" --max-turns 500
+          else
+            claude --permission-mode bypassPermissions --setting-sources project,local -p "$FEEDBACK_PROMPT" --max-turns 500
+          fi
+        fi
+      fi
+
+      if [ "$RESUMING" != true ]; then
+        post_status "🔧 **Agent working** — starting implementation"
+        slack_notify "$SLACK_WEBHOOK" "🔧 [${WORKSPACE}/${TEAM_NAME}] Agent started ${IDENTIFIER}: ${TITLE}"
+
+        claude --permission-mode bypassPermissions --setting-sources project,local -p "You are working in an isolated git worktree for the ${REPO_NAME} project.
+Read CLAUDE.md for all project conventions, architecture, and coding standards.
+
+## Your Task
+Implement the following Linear issue. Write tests where appropriate.
+Make structured, atomic commits as you work — one commit per logical change
+(e.g., separate commits for tests, implementation, docs, config changes).
+Use conventional commit messages (feat:, fix:, test:, docs:, refactor:, chore:).
+Do NOT save everything for one big commit at the end.
+
+## IMPORTANT: Do NOT push or open a PR
+The CI gate and PR creation are handled externally after you finish.
+Just implement, test, and commit. Do NOT run git push or gh pr create.
+
+## CRITICAL: If You Are Blocked or Need Clarification
+If you cannot fully implement the feature without human input (unclear requirements,
+pricing/business decisions, missing credentials, architectural choices that need approval, etc.):
+
+YOU MUST:
+1. Create the file \`.claude/agent-blocked/${IDENTIFIER}.md\` with your question(s)
+2. \`git add\` and \`git commit\` it
+3. STOP immediately — do NOT continue working, do NOT try to guess
+
+DO NOT just write your questions to stdout. DO NOT skip this and push anyway.
+The ONLY way to ask the developer a question is through the blocked file.
+The system reads this file and posts it to Linear for the developer to answer.
+
+If you have PARTIAL work done but still need answers, commit your partial work
+AND the blocked file together.
+
+## Linear Issue: ${IDENTIFIER}
+**Title:** ${TITLE}
+
+**Description:**
+${DESCRIPTION}
+
+## Documentation Requirements (MANDATORY)
+After implementation, you MUST update project documentation:
+
+1. **CHANGELOG or relevant docs**: If the project has a CHANGELOG.md, docs/ directory,
+   or similar, add an entry describing what was implemented and any decisions made.
+
+2. **Architecture/schema docs**: If you changed database schema, API contracts, or
+   component architecture, update the corresponding docs (e.g., docs/database/schema/,
+   API docs, component docs).
+
+3. **CLAUDE.md**: If you discovered a new convention, gotcha, or hard-won rule during
+   implementation, add it to the project's CLAUDE.md so future agents benefit.
+
+4. **Implementation summary**: Create a file at \`.claude/agent-reports/${IDENTIFIER}.md\`
+   with this structure:
+
+   # ${IDENTIFIER}: ${TITLE}
+
+   ## What was implemented
+   [Brief summary of changes]
+
+   ## Files changed
+   [List of files and what changed in each]
+
+   ## Decisions made
+   [Any architectural or implementation decisions and why]
+
+   ## Risks or follow-ups
+   [Anything that needs human attention or future work]
+
+   ## Tests
+   [What was tested and coverage notes]
+
+Commit all documentation updates as part of your work.
+
+Do NOT modify files outside this worktree." --max-turns 500
+      fi
+
+      # Save session ID for potential resume
+      WORKTREE_ESCAPED=$(echo "$WORKTREE" | tr '/' '-' | sed 's/^-//')
+      PROJECT_DIR="$HOME/.claude/projects/${WORKTREE_ESCAPED}"
+      if [ -d "$PROJECT_DIR" ]; then
+        LATEST_SESSION=$(ls -t "$PROJECT_DIR"/*.jsonl 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/\.jsonl$//')
+        if [ -n "$LATEST_SESSION" ]; then
+          echo "$LATEST_SESSION" > "$SESSION_FILE"
+        fi
+      fi
+
+      # --- Check if agent is blocked ---
+      BLOCKED_FILE=".claude/agent-blocked/${IDENTIFIER}.md"
+      if [ -f "$BLOCKED_FILE" ]; then
+        QUESTION=$(cat "$BLOCKED_FILE")
+        cleanup_status_comments
+        linear_comment "$API_KEY" "$ISSUE_ID" "🚧 **Agent blocked — needs human input**
+
+${QUESTION}
+
+---
+*Reply to this comment, then re-add the \`${LABEL}\` label to resume the agent.*" >/dev/null 2>&1
+        linear_set_state "$API_KEY" "$ISSUE_ID" "Todo" "$TEAM_ID" >/dev/null 2>&1
+        slack_notify "$SLACK_WEBHOOK" "🚧 [${WORKSPACE}/${TEAM_NAME}] Agent blocked on ${IDENTIFIER} — needs human input"
+        log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} blocked — question posted to Linear"
+        stop_agent_db "$IDENTIFIER"
+        exit 0
+      fi
+
+      # --- Check if agent made any commits ---
+      COMMIT_COUNT=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo "0")
+      if [ "$COMMIT_COUNT" -eq 0 ]; then
+        cleanup_status_comments
+        linear_comment "$API_KEY" "$ISSUE_ID" "⚠️ **Agent made no changes** — the agent ran but did not commit any code. This may indicate the feature already exists, the task is unclear, or the agent couldn't proceed.
+
+Check the agent log for details: \`$ISSUE_LOG\`" >/dev/null 2>&1
+        linear_set_state "$API_KEY" "$ISSUE_ID" "Todo" "$TEAM_ID" >/dev/null 2>&1
+        log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} no commits — skipping CI/push"
+        stop_agent_db "$IDENTIFIER"
+        exit 0
+      fi
+
+      # --- Deterministic CI gate with retry loop ---
+      CI_PASSED=false
+
+      if [ -n "$CI_GATE" ] && [ -x "$CI_GATE" ]; then
+        for ATTEMPT in $(seq 1 "$MAX_CI_RETRIES"); do
+          post_status "🔍 **CI gate running** (attempt ${ATTEMPT}/${MAX_CI_RETRIES}) — type-check, tests, build"
+
+          CI_OUTPUT_FILE="$LOG_DIR/${WORKSPACE}-${IDENTIFIER}-ci-${ATTEMPT}.log"
+          if "$CI_GATE" "$WORKTREE" > "$CI_OUTPUT_FILE" 2>&1; then
+            CI_PASSED=true
+            log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} CI gate passed (attempt ${ATTEMPT})"
+            break
+          fi
+
+          log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} CI gate failed (attempt ${ATTEMPT}/${MAX_CI_RETRIES})"
+          cat "$CI_OUTPUT_FILE" >> "$ISSUE_LOG"
+
+          if [ "$ATTEMPT" -lt "$MAX_CI_RETRIES" ]; then
+            CI_ERRORS=$(cat "$CI_OUTPUT_FILE")
+            post_status "🔄 **CI gate failed (attempt ${ATTEMPT})** — spawning Claude to fix errors"
+
+            claude --permission-mode bypassPermissions --setting-sources project,local -p "You are working in an isolated git worktree for the ${REPO_NAME} project.
+Read CLAUDE.md for all project conventions.
+
+## CI Gate Failed — Fix These Errors
+
+The CI gate (type-check, tests, build) failed after your implementation of ${IDENTIFIER}: ${TITLE}.
+
+Fix ALL failures below, even if they are unrelated to your changes. The CI gate must pass before we can push.
+
+## CI Gate Output:
+\`\`\`
+${CI_ERRORS}
+\`\`\`
+
+## Rules:
+- Fix every error shown above
+- Run the failing commands yourself to verify fixes before committing
+- Commit fixes with a message like 'fix: resolve CI failures for ${IDENTIFIER}'
+- Do NOT push or open a PR
+- Do NOT modify files outside this worktree" --max-turns 500 >> "$ISSUE_LOG" 2>&1
+          else
+            log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} CI gate FAILED after ${MAX_CI_RETRIES} attempts — not pushed"
+
+            REPORT_FILE=".claude/agent-reports/${IDENTIFIER}.md"
+            AGENT_REPORT=""
+            if [ -f "$REPORT_FILE" ]; then
+              AGENT_REPORT=$(cat "$REPORT_FILE")
+            fi
+
+            FAILURE_REPORT="# ${IDENTIFIER}: ${TITLE} — CI Failure Report
+
+## Status: FAILED after ${MAX_CI_RETRIES} attempts — needs human intervention
+
+## CI Gate Outputs
+"
+            for i in $(seq 1 "$MAX_CI_RETRIES"); do
+              local ATTEMPT_LOG="$LOG_DIR/${WORKSPACE}-${IDENTIFIER}-ci-${i}.log"
+              if [ -f "$ATTEMPT_LOG" ]; then
+                FAILURE_REPORT="${FAILURE_REPORT}
+### Attempt ${i}
+\`\`\`
+$(tail -40 "$ATTEMPT_LOG")
+\`\`\`
+"
+              fi
+            done
+
+            if [ -n "$AGENT_REPORT" ]; then
+              FAILURE_REPORT="${FAILURE_REPORT}
+## Agent's Fix Notes
+${AGENT_REPORT}"
+            fi
+
+            FAILURE_REPORT="${FAILURE_REPORT}
+## Files in worktree
+\`\`\`
+$(git diff --name-only origin/main 2>/dev/null || echo '(could not diff)')
+\`\`\`
+
+## Worktree location
+\`${WORKTREE}\`
+"
+
+            cleanup_status_comments
+            linear_comment "$API_KEY" "$ISSUE_ID" "❌ **CI gate failed after ${MAX_CI_RETRIES} attempts** — code not pushed.
+
+${FAILURE_REPORT}" >/dev/null 2>&1
+            slack_notify "$SLACK_WEBHOOK" "❌ [${WORKSPACE}/${TEAM_NAME}] CI failed after ${MAX_CI_RETRIES} attempts for ${IDENTIFIER} — needs human intervention"
+          fi
+        done
+
+        if [ "$CI_PASSED" = true ]; then
+          cleanup_status_comments
+
+          if [ "$RESUME_REASON" != "feedback" ]; then
+            REPORT_FILE=".claude/agent-reports/${IDENTIFIER}.md"
+            if [ -f "$REPORT_FILE" ]; then
+              REPORT_CONTENT=$(cat "$REPORT_FILE")
+              linear_comment "$API_KEY" "$ISSUE_ID" "📋 **Implementation Report**
+
+${REPORT_CONTENT}" >/dev/null 2>&1
+            fi
+          fi
+
+          git push -u origin "$BRANCH" 2>&1
+
+          EXISTING_PR=$(gh pr view "$BRANCH" --json url --jq '.url' 2>/dev/null || echo "")
+
+          if [ -n "$EXISTING_PR" ]; then
+            linear_set_state "$API_KEY" "$ISSUE_ID" "In Review" "$TEAM_ID" >/dev/null 2>&1
+            linear_comment "$API_KEY" "$ISSUE_ID" "✅ **Feedback addressed** — new commits pushed to existing PR: ${EXISTING_PR}
+
+Ready for re-review." >/dev/null 2>&1
+            slack_notify "$SLACK_WEBHOOK" "✅ [${WORKSPACE}/${TEAM_NAME}] ${IDENTIFIER} feedback addressed — PR updated: ${EXISTING_PR}"
+            log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} feedback addressed — PR: $EXISTING_PR"
+
+            # Auto-review existing PR if enabled
+            if [ "$AUTO_REVIEW" = true ]; then
+              local REVIEW_VERDICT
+              REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER")
+              if [ "$AUTO_FIX" = true ] && [ "$REVIEW_VERDICT" = "request_changes" ]; then
+                auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME"
+              fi
+            fi
+          else
+            REPORT_FILE=".claude/agent-reports/${IDENTIFIER}.md"
+            if [ -f "$REPORT_FILE" ]; then
+              PR_BODY="$(cat "$REPORT_FILE")
+
+---
+*Implemented by autonomous Claude agent. CI gate passed: type-check, tests, build.*
+Closes ${IDENTIFIER}"
+            else
+              PR_BODY="## ${IDENTIFIER}: ${TITLE}
+
+${DESCRIPTION}
+
+---
+*Implemented by autonomous Claude agent. CI gate passed: type-check, tests, build.*
+Closes ${IDENTIFIER}"
+            fi
+
+            PR_URL=$(gh pr create \
+              --title "${IDENTIFIER}: ${TITLE}" \
+              --body "$PR_BODY" \
+              --head "$BRANCH" \
+              --base main 2>&1 | tail -1 | grep -oE 'https://github\.com/[^ ]+')
+
+            if [ -n "$PR_URL" ]; then
+              linear_set_state "$API_KEY" "$ISSUE_ID" "In Review" "$TEAM_ID" >/dev/null 2>&1
+              linear_comment "$API_KEY" "$ISSUE_ID" "✅ **Agent completed** — CI gate passed, PR opened: ${PR_URL}
+
+Ready for human review." >/dev/null 2>&1
+              slack_notify "$SLACK_WEBHOOK" "✅ [${WORKSPACE}/${TEAM_NAME}] ${IDENTIFIER} completed — PR opened: ${PR_URL}"
+              log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} done — PR: $PR_URL"
+
+              # Auto-review new PR if enabled
+              if [ "$AUTO_REVIEW" = true ]; then
+                local REVIEW_VERDICT
+                REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER")
+                if [ "$AUTO_FIX" = true ] && [ "$REVIEW_VERDICT" = "request_changes" ]; then
+                  auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME"
+                fi
+              fi
+            else
+              linear_comment "$API_KEY" "$ISSUE_ID" "⚠️ **Push succeeded but PR creation failed** — check logs: \`$ISSUE_LOG\`" >/dev/null 2>&1
+              log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} pushed but PR creation failed"
+            fi
+          fi
+        fi
+      else
+        # No ci-gate — warn but still push
+        cleanup_status_comments
+        log "[$WORKSPACE/$TEAM_NAME] WARNING: ci-gate not found, pushing without checks"
+        git push -u origin "$BRANCH" 2>&1
+
+        EXISTING_PR=$(gh pr view "$BRANCH" --json url --jq '.url' 2>/dev/null || echo "")
+
+        if [ -n "$EXISTING_PR" ]; then
+          linear_set_state "$API_KEY" "$ISSUE_ID" "In Review" "$TEAM_ID" >/dev/null 2>&1
+          linear_comment "$API_KEY" "$ISSUE_ID" "✅ **Feedback addressed (no CI gate)** — PR updated: ${EXISTING_PR}" >/dev/null 2>&1
+          slack_notify "$SLACK_WEBHOOK" "✅ [${WORKSPACE}/${TEAM_NAME}] ${IDENTIFIER} feedback addressed — PR updated: ${EXISTING_PR}"
+        else
+          PR_URL=$(gh pr create \
+            --title "${IDENTIFIER}: ${TITLE}" \
+            --body "${IDENTIFIER}: ${TITLE} — implemented by autonomous Claude agent." \
+            --head "$BRANCH" --base main 2>&1 | tail -1 | grep -oE 'https://github\.com/[^ ]+')
+          linear_set_state "$API_KEY" "$ISSUE_ID" "In Review" "$TEAM_ID" >/dev/null 2>&1
+          linear_comment "$API_KEY" "$ISSUE_ID" "⚠️ **Agent completed (no CI gate)** — PR: ${PR_URL}" >/dev/null 2>&1
+          slack_notify "$SLACK_WEBHOOK" "✅ [${WORKSPACE}/${TEAM_NAME}] ${IDENTIFIER} completed (no CI gate) — PR: ${PR_URL}"
+        fi
+
+        # Auto-review even without ci-gate
+        if [ "$AUTO_REVIEW" = true ]; then
+          local REVIEW_VERDICT
+          REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER")
+          if [ "$AUTO_FIX" = true ] && [ "$REVIEW_VERDICT" = "request_changes" ]; then
+            auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME"
+          fi
+        fi
+      fi
+
+      # Stop DB container
+      stop_agent_db "$IDENTIFIER"
+
+    ) >> "$ISSUE_LOG" 2>&1 &
+
+    log "[$WORKSPACE/$TEAM_NAME] Spawned agent for ${IDENTIFIER} (log: $ISSUE_LOG)"
+  done
+
+  rm -f "$LOCK_FILE"
+}
+
+# --- Entry point ---
+
+# Parse global flags first
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --auto-review) AUTO_REVIEW=true; shift ;;
+    --auto-fix) AUTO_FIX=true; AUTO_REVIEW=true; shift ;;
+    --sequenced) SEQUENCED=true; shift ;;
+    *) break ;;
+  esac
+done
+
+case "${1:-}" in
+  --all|"")
+    WORKSPACES=$(jq -r '.workspaces | keys[]' "$CONFIG")
+    while IFS= read -r WS; do
+      API_KEY=$(resolve_api_key "$WS") || { log "No API key for workspace: $WS"; continue; }
+
+      TEAMS=$(jq -r ".workspaces[\"$WS\"].teams | to_entries[] | \"\(.key)|\(.value.repo)|\(.value.local_db // \"none\")\"" "$CONFIG")
+      while IFS='|' read -r TEAM_NAME REPO_DIR LOCAL_DB; do
+        run_agents_for_team "$API_KEY" "$WS" "$TEAM_NAME" "$REPO_DIR" "$LOCAL_DB"
+      done <<< "$TEAMS"
+    done <<< "$WORKSPACES"
+    ;;
+  --pipeline)
+    shift
+    PIPELINE_FILE="${1:-}"
+    shift || true
+    PIPELINE_WS=""
+    PIPELINE_TEAM=""
+    PIPELINE_DRY_RUN=false
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --workspace) PIPELINE_WS="$2"; shift 2 ;;
+        --team) PIPELINE_TEAM="$2"; shift 2 ;;
+        --dry-run) PIPELINE_DRY_RUN=true; shift ;;
+        *) shift ;;
+      esac
+    done
+    if [ -z "$PIPELINE_FILE" ]; then
+      echo "Usage: claude-agent-runner --pipeline <requirements.md> [--workspace <name>] [--team <name>] [--dry-run]"
+      exit 1
+    fi
+    run_pipeline "$PIPELINE_FILE" "$PIPELINE_WS" "$PIPELINE_TEAM" "$PIPELINE_DRY_RUN"
+    ;;
+  --review-pr)
+    shift
+    REVIEW_PR_NUM="${1:-}"
+    shift || true
+    REVIEW_REPO=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --repo) REVIEW_REPO="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [ -z "$REVIEW_PR_NUM" ] || [ -z "$REVIEW_REPO" ]; then
+      echo "Usage: claude-agent-runner --review-pr <number> --repo <path>"
+      exit 1
+    fi
+    cd "$REVIEW_REPO" || { echo "ERROR: Repo not found: $REVIEW_REPO"; exit 1; }
+    BRANCH=$(gh pr view "$REVIEW_PR_NUM" --json headRefName --jq '.headRefName' 2>/dev/null)
+    if [ -z "$BRANCH" ]; then
+      echo "ERROR: PR #${REVIEW_PR_NUM} not found"
+      exit 1
+    fi
+    auto_review_pr "$REVIEW_REPO" "$BRANCH" "PR-${REVIEW_PR_NUM}"
+    ;;
+  --cleanup)
+    jq -r '.workspaces | to_entries[] | .value.teams | to_entries[] | .value.repo' "$CONFIG" | while IFS= read -r repo; do
+      cleanup_worktrees "$repo"
+    done
+    ;;
+  --status)
+    show_status
+    ;;
+  --help|-h)
+    echo "claude-agent-runner — Autonomous Claude agents from Linear issues"
+    echo ""
+    echo "Usage:"
+    echo "  claude-agent-runner                                   Poll all workspaces (default)"
+    echo "  claude-agent-runner --auto-review                     Poll + auto-review PRs"
+    echo "  claude-agent-runner --auto-fix                        Poll + auto-review + fix loop"
+    echo "  claude-agent-runner --sequenced                       Only pick up unblocked issues"
+    echo "  claude-agent-runner --pipeline <file.md> [options]    Parse requirements → Linear"
+    echo "  claude-agent-runner --review-pr <num> --repo <path>   Standalone PR review"
+    echo "  claude-agent-runner --cleanup                         Clean up merged worktrees"
+    echo "  claude-agent-runner --status                          Show active agents"
+    echo "  claude-agent-runner --help                            Show this help"
+    echo ""
+    echo "Pipeline options:"
+    echo "  --workspace <name>   Target workspace (default: first in config)"
+    echo "  --team <name>        Target team (default: first in workspace)"
+    echo "  --dry-run            Print parsed stories without creating issues"
+    echo ""
+    echo "Global flags (combinable with any mode):"
+    echo "  --auto-review        Auto-review PRs after creation/update"
+    echo "  --auto-fix           Auto-review + fix loop (up to $MAX_REVIEW_FIX_ITERATIONS iterations)"
+    echo "  --sequenced          Skip issues with incomplete blockers"
+    echo ""
+    echo "Config:  $CONFIG"
+    echo "Logs:    $LOG_DIR"
+    echo ""
+    echo "API Keys (set per workspace via env vars):"
+    echo "  Option 1: Set 'api_key_env' in config → references a custom env var name"
+    echo "  Option 2: Export LINEAR_API_KEY_<WORKSPACE> (auto-detected)"
+    echo "  Option 3: Export LINEAR_API_KEY (global fallback)"
+    echo ""
+    echo "How it works:"
+    echo "  1. Label a Linear issue with '$LABEL'"
+    echo "  2. Runner picks it up, moves to In Progress, spawns Claude"
+    echo "  3. Claude implements in an isolated worktree, opens a GitHub PR"
+    echo "  4. Runner runs CI gate, pushes, creates PR"
+    echo "  5. Optional: auto-review and auto-fix cycle"
+    echo "  6. You review the PR"
+    ;;
+  *)
+    echo "Unknown option: $1 (try --help)"
+    exit 1
+    ;;
+esac
+
+wait
+log "All agents finished."

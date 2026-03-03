@@ -1,0 +1,20 @@
+{
+  "label": "Agent",
+  "max_parallel": 3,
+  "max_turns": 15,
+  "max_ci_retries": 3,
+  "max_review_fix_iterations": 3,
+  "ci_gate_path": "",
+  "workspaces": {
+    "example": {
+      "api_key_env": "LINEAR_API_KEY_EXAMPLE",
+      "slack_webhook_env": "SLACK_WEBHOOK_EXAMPLE",
+      "teams": {
+        "Engineering": {
+          "repo": "/path/to/repo",
+          "local_db": "postgres"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,137 @@
+#!/bin/bash
+# ci-gate — Deterministic CI checks that MUST pass before push/PR
+# Called by claude-agent-runner before opening PRs.
+# Also usable standalone: ci-gate [repo-path]
+#
+# Exit 0 = all checks pass, safe to push
+# Exit 1 = checks failed, do NOT push
+#
+# Looks for a .ci-gate file in the repo root for project-specific commands.
+# Falls back to sensible defaults if none exists.
+
+set -euo pipefail
+
+REPO_DIR="${1:-.}"
+cd "$REPO_DIR"
+
+REPO_NAME=$(basename "$(git rev-parse --show-toplevel)")
+GATE_FILE=".ci-gate"
+FAILED=0
+
+log() { echo "[ci-gate] $1"; }
+pass() { echo "[ci-gate] ✓ $1"; }
+fail() { echo "[ci-gate] ✗ $1"; FAILED=1; }
+
+# --- Run project-specific gate if it exists ---
+
+if [ -f "$GATE_FILE" ]; then
+  log "Running project gate: $GATE_FILE"
+  while IFS= read -r cmd; do
+    # Skip comments and blank lines
+    [[ -z "$cmd" || "$cmd" == \#* ]] && continue
+
+    log "Running: $cmd"
+    if eval "$cmd"; then
+      pass "$cmd"
+    else
+      fail "$cmd"
+    fi
+  done < "$GATE_FILE"
+
+  if [ "$FAILED" -eq 0 ]; then
+    pass "All checks passed"
+  else
+    fail "CI gate failed — do NOT push"
+  fi
+  exit "$FAILED"
+fi
+
+# --- Default gate: auto-detect project type ---
+
+log "No .ci-gate found, running default checks for $REPO_NAME"
+
+# TypeScript / Next.js project
+if [ -f "package.json" ]; then
+  # Find the right directory (monorepo support)
+  if [ -f "dashboard/package.json" ]; then
+    APP_DIR="dashboard"
+  else
+    APP_DIR="."
+  fi
+
+  # Type check
+  log "Type checking..."
+  if (cd "$APP_DIR" && npx tsc --noEmit 2>&1); then
+    pass "Type check"
+  else
+    fail "Type check"
+  fi
+
+  # Tests
+  if (cd "$APP_DIR" && grep -q '"test' package.json 2>/dev/null); then
+    log "Running tests..."
+    if (cd "$APP_DIR" && npx vitest run 2>&1); then
+      pass "Tests"
+    else
+      fail "Tests"
+    fi
+  fi
+
+  # Build — detect framework
+  log "Building..."
+  if (cd "$APP_DIR" && grep -q '"next"' package.json 2>/dev/null); then
+    # Next.js project
+    if (cd "$APP_DIR" && npx next build 2>&1); then
+      pass "Build (next)"
+    else
+      fail "Build (next)"
+    fi
+  elif (cd "$APP_DIR" && grep -q '"vite"' package.json 2>/dev/null); then
+    # Vite project
+    if (cd "$APP_DIR" && npx vite build 2>&1); then
+      pass "Build (vite)"
+    else
+      fail "Build (vite)"
+    fi
+  elif (cd "$APP_DIR" && jq -e '.scripts.build' package.json >/dev/null 2>&1); then
+    # Generic build script
+    if (cd "$APP_DIR" && npm run build 2>&1); then
+      pass "Build"
+    else
+      fail "Build"
+    fi
+  else
+    log "No build command detected, skipping"
+  fi
+
+# Rust project
+elif [ -f "Cargo.toml" ]; then
+  log "Running cargo checks..."
+  if cargo check 2>&1; then pass "cargo check"; else fail "cargo check"; fi
+  if cargo test 2>&1; then pass "cargo test"; else fail "cargo test"; fi
+  if cargo clippy -- -D warnings 2>&1; then pass "clippy"; else fail "clippy"; fi
+
+# Python project
+elif [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
+  if command -v pytest &>/dev/null; then
+    if pytest 2>&1; then pass "pytest"; else fail "pytest"; fi
+  fi
+  if command -v mypy &>/dev/null; then
+    if mypy . 2>&1; then pass "mypy"; else fail "mypy"; fi
+  fi
+
+# Go project
+elif [ -f "go.mod" ]; then
+  if go vet ./... 2>&1; then pass "go vet"; else fail "go vet"; fi
+  if go test ./... 2>&1; then pass "go test"; else fail "go test"; fi
+
+else
+  log "Unknown project type — skipping default checks"
+fi
+
+if [ "$FAILED" -eq 0 ]; then
+  pass "All checks passed"
+else
+  fail "CI gate failed — do NOT push"
+fi
+exit "$FAILED"
