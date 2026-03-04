@@ -11,9 +11,12 @@ Autonomous Claude Code agent orchestrator. Polls Linear for labeled issues, spaw
 - **Feedback resume**: Re-label an issue to resume with PR review feedback
 - **Auto-review**: Spawns a read-only Claude to review PRs with structured feedback
 - **Auto-fix loop**: Iterates review → fix → CI → push until approved (configurable max)
+- **Orchestration**: Multi-agent decomposition — add the "Orchestrate" label to break a ticket into scoped subtasks with a supervisor
+- **Scoped workers**: File-scope enforcement via hook — workers can only write to their assigned files
 - **Pipeline**: Parse a requirements markdown into Linear issues with dependency chains
+- **Spec generation**: Turn a free-form idea into structured requirements with `--spec`
 - **Dependency sequencing**: Only pick up issues whose blockers are completed
-- **Guardrails**: Hook blocks destructive commands (rm -rf, force-push, DROP TABLE) in agent mode
+- **Guardrails**: Hooks block destructive commands and enforce file scope in agent mode
 - **Multi-workspace**: Support multiple Linear workspaces and teams
 - **Slack notifications**: Optional webhook notifications at key lifecycle points
 
@@ -49,6 +52,11 @@ claude-agent-runner --sequenced
 claude-agent-runner --pipeline requirements.md --workspace myapp --team Engineering
 claude-agent-runner --pipeline requirements.md --dry-run
 
+# Generate spec from an idea, optionally create Linear issues
+claude-agent-runner --spec idea.md
+claude-agent-runner --spec idea.md --interactive
+claude-agent-runner --spec idea.md --create
+
 # Standalone PR review
 claude-agent-runner --review-pr 42 --repo /path/to/repo
 
@@ -71,6 +79,14 @@ claude-agent-runner --status
   "max_ci_retries": 3,
   "max_review_fix_iterations": 3,
   "ci_gate_path": "",
+  "orchestrator": {
+    "enabled": false,
+    "label": "Orchestrate",
+    "max_subtasks": 8,
+    "max_orchestrator_turns": 50,
+    "poll_interval_seconds": 30,
+    "max_validation_retries": 2
+  },
   "workspaces": {
     "myapp": {
       "api_key_env": "LINEAR_API_KEY_MYAPP",
@@ -96,6 +112,17 @@ claude-agent-runner --status
 | `max_ci_retries` | `3` | CI gate retry attempts with auto-fix |
 | `max_review_fix_iterations` | `3` | Auto-fix loop iterations |
 | `ci_gate_path` | `""` | Explicit path to ci-gate (auto-detected if empty) |
+
+### Orchestrator Fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `orchestrator.enabled` | `false` | Enable multi-agent orchestration |
+| `orchestrator.label` | `"Orchestrate"` | Linear label that triggers orchestration |
+| `orchestrator.max_subtasks` | `8` | Max subtasks per decomposition |
+| `orchestrator.max_orchestrator_turns` | `50` | Claude turns for decomposition |
+| `orchestrator.poll_interval_seconds` | `30` | Supervisor polling interval |
+| `orchestrator.max_validation_retries` | `2` | Retries for failed subtask validation |
 
 ### Team Fields
 
@@ -129,6 +156,38 @@ claude-agent-runner --status
 8. Pushes branch, creates GitHub PR
 9. Optional: auto-review → auto-fix loop
 10. Posts implementation report to Linear
+```
+
+### Orchestrated Multi-Agent
+
+For complex, multi-concern features:
+
+```
+1. Add "Agent" + "Orchestrate" labels to a Linear issue
+2. Runner spawns an orchestrator Claude to decompose the issue
+3. Orchestrator explores codebase, creates scoped subtask JSON files
+4. Runner creates Linear sub-issues with file scope metadata
+5. Sub-issues get "Agent" label → picked up as scoped workers
+6. Workers implement within their file scope (enforced by scope-guard hook)
+7. Orchestrator polls for completion, handles scope overflow
+8. After all subtasks done: integration CI → combined PR
+```
+
+If the orchestrator decides the issue doesn't need decomposition (single-concern), it falls back to the standard single-agent flow automatically.
+
+### Spec Generation
+
+Turn ideas into actionable Linear issues:
+
+```bash
+# Generate structured requirements from a free-form idea
+claude-agent-runner --spec idea.md
+
+# Interactive mode — Claude asks clarifying questions
+claude-agent-runner --spec idea.md --interactive
+
+# Generate and create Linear issues in one step
+claude-agent-runner --spec idea.md --create
 ```
 
 ### Feedback Resume
