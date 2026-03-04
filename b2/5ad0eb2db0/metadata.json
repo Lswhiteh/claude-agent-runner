@@ -1,0 +1,37 @@
+{
+  "cli_version": "0.4.9",
+  "checkpoint_id": "b25ad0eb2db0",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "CLAUDE.md",
+    "bin/claude-agent-runner",
+    "hooks/auto-lint.sh",
+    "hooks/command-budget.sh",
+    "hooks/command-rewriter.sh",
+    "hooks/pre-compact.sh",
+    "hooks/rtk-failure-hint.sh",
+    "hooks/session-context.sh",
+    "hooks/stop-gate.sh",
+    "hooks/subagent-collector.sh",
+    "hooks/task-validator.sh",
+    "setup.sh"
+  ],
+  "sessions": [
+    {
+      "metadata": "/b2/5ad0eb2db0/0/metadata.json",
+      "transcript": "/b2/5ad0eb2db0/0/full.jsonl",
+      "context": "/b2/5ad0eb2db0/0/context.md",
+      "content_hash": "/b2/5ad0eb2db0/0/content_hash.txt",
+      "prompt": "/b2/5ad0eb2db0/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 51,
+    "cache_creation_tokens": 80288,
+    "cache_read_tokens": 3274891,
+    "output_tokens": 18207,
+    "api_call_count": 47
+  }
+}

@@ -1,0 +1,123 @@
+Implement the following plan:
+
+# Plan: Add Claude Code Hooks Suite to claude-agent-runner
+
+## Context
+
+The agent runner currently has only 2 hooks (block-destructive.sh, scope-guard.sh) — both PreToolUse:Bash guards. Claude Code supports 16 hook event types with rich control (blocking, context injection, input rewriting, async execution). This plan adds 9 new hooks across 7 event types to improve agent safety, observability, and self-correction. It also fixes the broken settings.json registration format in setup.sh.
+
+## New Hooks (9 files)
+
+### 1. `hooks/stop-gate.sh` — Stop event
+- Gate: `CLAUDE_AGENT_MODE=1`
+- Checks `stop_hook_active` to prevent infinite loops
+- Parses transcript JSONL for evidence of CI/test runs (ci-gate, npm test, pytest, cargo test, vitest, jest, go test)
+- If no test evidence found → `{"decision": "block", "reason": "Run CI checks before finishing"}`
+- Falls back gracefully (allows stop) if transcript unreadable
+
+### 2. `hooks/rtk-failure-hint.sh` — PostToolUseFailure:Bash
+- No gate (useful everywhere, not just agent mode)
+- When `tool_input.command` starts with `rtk ` but not `rtk proxy` → inject additionalContext: "Re-run with `rtk proxy <cmd>` to see full output"
+
+### 3. `hooks/session-context.sh` — SessionStart
+- Gate: `CLAUDE_AGENT_MODE=1`
+- Reads `CLAUDE_AGENT_ISSUE_ID`, `CLAUDE_AGENT_REPO`, `CLAUDE_AGENT_BRANCH`, `CLAUDE_AGENT_WORKTREE` env vars
+- Outputs additionalContext with agent identity summary
+- Writes exports to `$CLAUDE_ENV_FILE` if available (persists env vars to all Bash calls in the session)
+
+### 4. `hooks/auto-lint.sh` — PostToolUse:Edit/Write (async)
+- Gate: `CLAUDE_AGENT_MODE=1`
+- Extracts `file_path` from tool_input, checks extension
+- Detects lint config in cwd (eslint for ts/js, ruff for py)
+- Runs linter; output delivered as context on next turn
+- Async: non-blocking, won't slow down writes
+
+### 5. `hooks/command-budget.sh` — PreToolUse:Bash
+- Gate: `CLAUDE_AGENT_MODE=1`
+- Counter file at `/tmp/claude-agent-budget-${SESSION_ID}` (from stdin JSON)
+- Increments on each Bash call
+- At threshold (default `$CLAUDE_AGENT_CMD_BUDGET` or 300) → deny with "agent may be stuck" message
+
+### 6. `hooks/subagent-collector.sh` — SubagentStop
+- Gate: `CLAUDE_AGENT_SCOPED=1` (orchestrated workers only)
+- Appends `{timestamp, agent_id, agent_type, summary}` to `.claude/orchestrator/subagent-log.jsonl`
+- Pure logging, no blocking
+
+### 7. `hooks/task-validator.sh` — TaskCompleted
+- Gate: `CLAUDE_AGENT_MODE=1`
+- Same transcript parsing as stop-gate (shared inline function)
+- Exit 2 + stderr message to block task completion if no test evidence
+
+### 8. `hooks/command-rewriter.sh` — PreToolUse:Bash
+- Gate: `CLAUDE_AGENT_MODE=1`
+- Rewrites `npm install <packages>` (without --save-exact) → adds `--save-exact`
+- Uses `updatedInput` in hookSpecificOutput to modify the command
+- Only fires for package installs, not bare `npm install` or `npm ci`
+
+### 9. `hooks/pre-compact.sh` — PreCompact
+- Gate: `CLAUDE_AGENT_MODE=1`
+- Saves snapshot to `.claude/agent-state/compact-snapshot-$TIMESTAMP.md`
+- Includes: git diff --stat, git status --short, git log --oneline -10
+- Non-blocking (PreCompact cannot prevent compaction)
+
+### NOT implementing: WorktreeCreate/Remove
+Agent runner creates worktrees via `git worktree add` directly — these hooks only fire for Claude Code's built-in worktree feature, so they're not applicable.
+
+## Modified Files (2)
+
+### `setup.sh` — Fix registration format + register all hooks
+- Replace flat-format registration (lines 46-63) with `register_hook()` function using the correct nested format: `hooks.<EventName>[{matcher, hooks:[{type, command}]}]`
+- Register all 11 hooks (2 existing + 9 new) with correct event types and matchers
+- Idempotent: check for existing command path before adding
+- Update summary section to list all hooks
+
+### `bin/claude-agent-runner` — Export agent identity env vars
+- At all 4 `claude` invocation sites (lines ~795, 900, 1315, 1748), add exports:
+  ```
+  CLAUDE_AGENT_ISSUE_ID, CLAUDE_AGENT_REPO, CLAUDE_AGENT_BRANCH, CLAUDE_AGENT_WORKTREE
+  ```
+- These are already available as bash locals; just need `export`
+
+## Hook Registration Map
+
+| Hook file | Event | Matcher | Async |
+|---|---|---|---|
+| block-destructive.sh | PreToolUse | Bash | no |
+| scope-guard.sh | PreToolUse | Bash | no |
+| command-budget.sh | PreToolUse | Bash | no |
+| command-rewriter.sh | PreToolUse | Bash | no |
+| auto-lint.sh | PostToolUse | Edit\|Write | yes |
+| rtk-failure-hint.sh | PostToolUseFailure | Bash | no |
+| session-context.sh | SessionStart | (empty) | no |
+| stop-gate.sh | Stop | (empty) | no |
+| subagent-collector.sh | SubagentStop | (empty) | no |
+| task-validator.sh | TaskCompleted | (empty) | no |
+| pre-compact.sh | PreCompact | (empty) | no |
+
+## Implementation Order
+
+1. **Phase 1 — Self-contained hooks** (no runner changes): rtk-failure-hint, command-rewriter, command-budget, pre-compact, subagent-collector, auto-lint
+2. **Phase 2 — Transcript-parsing hooks**: stop-gate, task-validator (share same grep patterns)
+3. **Phase 3 — Runner changes**: export env vars in bin/claude-agent-runner, then session-context
+4. **Phase 4 — setup.sh overhaul**: rewrite registration, register all 11 hooks, update summary
+
+## Verification
+
+Each hook testable with:
+```bash
+echo '<JSON payload>' | ENV_VAR=1 bash hooks/<hook>.sh
+```
+
+Three cases per hook:
+1. Gate inactive → silent exit 0
+2. Gate active, condition not met → silent exit 0
+3. Gate active, condition met → correct output (deny JSON / context JSON / exit 2)
+
+After setup.sh changes: run twice, verify no duplicate registrations in ~/.claude/settings.json.
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/lswhiteh/.claude/projects/-Users-lswhiteh-Work-claude-agent-runner/73abad2c-f532-4ae6-8bb3-fece63c41856.jsonl
+
+---
+
+push

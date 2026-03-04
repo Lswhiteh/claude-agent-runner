@@ -1,0 +1,41 @@
+{
+  "cli_version": "0.4.9",
+  "checkpoint_id": "b25ad0eb2db0",
+  "session_id": "89576743-fb86-4ccd-9ef1-fe3568ecfa77",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-04T19:48:03.061576Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "CLAUDE.md",
+    "bin/claude-agent-runner",
+    "hooks/auto-lint.sh",
+    "hooks/command-budget.sh",
+    "hooks/command-rewriter.sh",
+    "hooks/pre-compact.sh",
+    "hooks/rtk-failure-hint.sh",
+    "hooks/session-context.sh",
+    "hooks/stop-gate.sh",
+    "hooks/subagent-collector.sh",
+    "hooks/task-validator.sh",
+    "setup.sh"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "3a5adfec6873",
+  "token_usage": {
+    "input_tokens": 51,
+    "cache_creation_tokens": 80288,
+    "cache_read_tokens": 3274891,
+    "output_tokens": 18207,
+    "api_call_count": 47
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-04T19:48:02.612308Z",
+    "agent_lines": 529,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 529,
+    "agent_percentage": 100
+  }
+}
