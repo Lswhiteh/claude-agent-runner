@@ -568,6 +568,8 @@ auto_review_pr() {
   local REPO_DIR="$1"
   local BRANCH="$2"
   local IDENTIFIER="$3"
+  local ISSUE_TITLE="${4:-}"
+  local ISSUE_DESCRIPTION="${5:-}"
 
   cd "$REPO_DIR" || return 1
 
@@ -587,6 +589,16 @@ auto_review_pr() {
   PR_TITLE=$(gh pr view "$BRANCH" --json title --jq '.title' 2>/dev/null)
   PR_BODY=$(gh pr view "$BRANCH" --json body --jq '.body' 2>/dev/null)
 
+  # Build issue context section if available
+  local ISSUE_CONTEXT=""
+  if [ -n "$ISSUE_TITLE" ] || [ -n "$ISSUE_DESCRIPTION" ]; then
+    ISSUE_CONTEXT="### Original Issue: ${IDENTIFIER}
+**Title:** ${ISSUE_TITLE}
+**Description:**
+${ISSUE_DESCRIPTION}
+"
+  fi
+
   # Create a temp file for the review prompt
   local REVIEW_PROMPT
   REVIEW_PROMPT=$(mktemp)
@@ -598,6 +610,8 @@ You are a senior code reviewer. Review this PR thoroughly.
 ### Description
 ${PR_BODY}
 
+${ISSUE_CONTEXT}
+
 ### Diff
 \`\`\`diff
 ${DIFF}
@@ -608,6 +622,7 @@ Review the code and output ONLY a JSON object with this exact structure:
 {
   "verdict": "approve" | "request_changes" | "comment",
   "summary": "1-2 sentence overall assessment",
+  "requirements_coverage": "Does the PR address all requirements from the issue? List any gaps.",
   "blocking": ["list of issues that MUST be fixed before merge"],
   "important": ["list of issues that SHOULD be fixed"],
   "nits": ["minor style/preference suggestions"],
@@ -616,6 +631,7 @@ Review the code and output ONLY a JSON object with this exact structure:
 
 Rules:
 - Only use "request_changes" for genuine bugs, security issues, or broken functionality
+- Check requirements_coverage: if the PR doesn't implement what the issue asked for, that's blocking
 - Style preferences and minor improvements should be "nits" or "important", not blocking
 - Be specific — reference file names and line numbers
 - Output ONLY the JSON, no markdown fences, no extra text
@@ -642,9 +658,19 @@ REVIEW_EOF
     IMPORTANT=$(echo "$REVIEW_OUTPUT" | jq -r '.important // [] | map("- **Important**: " + .) | join("\n")' 2>/dev/null)
     NITS=$(echo "$REVIEW_OUTPUT" | jq -r '.nits // [] | map("- _Nit_: " + .) | join("\n")' 2>/dev/null)
     PRAISE=$(echo "$REVIEW_OUTPUT" | jq -r '.praise // [] | map("- :thumbsup: " + .) | join("\n")' 2>/dev/null)
+    local REQ_COVERAGE
+    REQ_COVERAGE=$(echo "$REVIEW_OUTPUT" | jq -r '.requirements_coverage // ""' 2>/dev/null)
+
+    local REQ_SECTION=""
+    if [ -n "$REQ_COVERAGE" ]; then
+      REQ_SECTION="### Requirements Coverage
+${REQ_COVERAGE}
+"
+    fi
 
     REVIEW_BODY="## Auto-Review: ${SUMMARY}
 
+${REQ_SECTION}
 ${BLOCKING}
 ${IMPORTANT}
 ${NITS}
@@ -691,6 +717,8 @@ auto_fix_loop() {
   local BRANCH="$3"
   local IDENTIFIER="$4"
   local REPO_NAME="$5"
+  local ISSUE_TITLE="${6:-}"
+  local ISSUE_DESCRIPTION="${7:-}"
 
   cd "$WORKTREE" || return 1
 
@@ -768,7 +796,7 @@ Make new commits. Do NOT push." --max-turns 200 >> "$LOG_DIR/${IDENTIFIER}-fix-c
 
     # Re-run auto-review
     local NEW_VERDICT
-    NEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER")
+    NEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$ISSUE_TITLE" "$ISSUE_DESCRIPTION")
 
     if [ "$NEW_VERDICT" = "approve" ]; then
       log "[auto-fix] PR approved after fix iteration ${ITER}"
@@ -1220,6 +1248,19 @@ Output ONLY a JSON object with these fields:
         ISSUE_TYPE=$(echo "$PREFLIGHT_OUTPUT" | jq -r '.type // "feature"' 2>/dev/null || echo "feature")
         PREFLIGHT_VERDICT=$(echo "$PREFLIGHT_OUTPUT" | jq -r '.verdict // "proceed"' 2>/dev/null || echo "proceed")
         PREFLIGHT_NOTES=$(echo "$PREFLIGHT_OUTPUT" | jq -r '.notes // ""' 2>/dev/null || echo "")
+        ISSUE_COMPLEXITY=$(echo "$PREFLIGHT_OUTPUT" | jq -r '.complexity // "medium"' 2>/dev/null || echo "medium")
+
+        # Adaptive turn budget based on complexity and type
+        case "$ISSUE_COMPLEXITY" in
+          low)  IMPL_TURNS=200 ;;
+          high) IMPL_TURNS=800 ;;
+          *)    IMPL_TURNS=500 ;;
+        esac
+        # Bug fixes with RCA need more turns for investigation
+        if [ "$ISSUE_TYPE" = "bug" ]; then
+          IMPL_TURNS=$((IMPL_TURNS + 100))
+        fi
+        log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} turn budget: ${IMPL_TURNS} (complexity: ${ISSUE_COMPLEXITY}, type: ${ISSUE_TYPE})"
 
         if [ "$PREFLIGHT_VERDICT" = "block" ]; then
           BLOCK_REASON=$(echo "$PREFLIGHT_OUTPUT" | jq -r '.block_reason // "Requirements insufficient"' 2>/dev/null)
@@ -1382,7 +1423,7 @@ $([ "$ISSUE_TYPE" = "bug" ] && echo "   ## Root Cause Analysis
 
 Commit all documentation updates as part of your work.
 
-Do NOT modify files outside this worktree." --max-turns 500
+Do NOT modify files outside this worktree." --max-turns "$IMPL_TURNS"
         fi
       fi
 
@@ -1394,6 +1435,13 @@ Do NOT modify files outside this worktree." --max-turns 500
         if [ -n "$LATEST_SESSION" ]; then
           echo "$LATEST_SESSION" > "$SESSION_FILE"
         fi
+      fi
+
+      # --- Checkpoint: tag post-implementation state for rollback ---
+      IMPL_COMMIT_COUNT=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo "0")
+      if [ "$IMPL_COMMIT_COUNT" -gt 0 ]; then
+        git tag -f "checkpoint/${IDENTIFIER}/post-impl" HEAD 2>/dev/null
+        log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} checkpoint tagged (${IMPL_COMMIT_COUNT} commits)"
       fi
 
       # --- Check if agent is blocked ---
@@ -1500,6 +1548,7 @@ $([ ! -f ".claude/agent-reports/${IDENTIFIER}.md" ] && echo "IMPORTANT: No agent
           CI_OUTPUT_FILE="$LOG_DIR/${WORKSPACE}-${IDENTIFIER}-ci-${ATTEMPT}.log"
           if "$CI_GATE" "$WORKTREE" > "$CI_OUTPUT_FILE" 2>&1; then
             CI_PASSED=true
+            git tag -f "checkpoint/${IDENTIFIER}/ci-passed" HEAD 2>/dev/null
             log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} CI gate passed (attempt ${ATTEMPT})"
             break
           fi
@@ -1511,14 +1560,44 @@ $([ ! -f ".claude/agent-reports/${IDENTIFIER}.md" ] && echo "IMPORTANT: No agent
             CI_ERRORS=$(cat "$CI_OUTPUT_FILE")
             post_status "🔄 **CI gate failed (attempt ${ATTEMPT})** — spawning Claude to fix errors"
 
+            # Categorize CI errors for smarter fixing
+            CI_HAS_TYPE_ERRORS=false
+            CI_HAS_TEST_FAILURES=false
+            CI_HAS_LINT_ERRORS=false
+            CI_HAS_BUILD_ERRORS=false
+            echo "$CI_ERRORS" | grep -qiE 'TS[0-9]+|type.*error|cannot find.*type|not assignable' && CI_HAS_TYPE_ERRORS=true
+            echo "$CI_ERRORS" | grep -qiE 'FAIL|AssertionError|expect.*toBe|test.*failed' && CI_HAS_TEST_FAILURES=true
+            echo "$CI_ERRORS" | grep -qiE 'eslint|lint|warning.*rule|prettier' && CI_HAS_LINT_ERRORS=true
+            echo "$CI_ERRORS" | grep -qiE 'build.*fail|module not found|cannot resolve|compilation' && CI_HAS_BUILD_ERRORS=true
+
+            CI_DIAGNOSIS="Error categories detected:"
+            $CI_HAS_TYPE_ERRORS && CI_DIAGNOSIS="$CI_DIAGNOSIS\n- TYPE ERRORS: Fix type mismatches, missing types, incorrect generics"
+            $CI_HAS_TEST_FAILURES && CI_DIAGNOSIS="$CI_DIAGNOSIS\n- TEST FAILURES: Check if your implementation is correct — do NOT modify test assertions unless the old behavior was intentionally changed"
+            $CI_HAS_LINT_ERRORS && CI_DIAGNOSIS="$CI_DIAGNOSIS\n- LINT ERRORS: Fix formatting, unused imports, rule violations"
+            $CI_HAS_BUILD_ERRORS && CI_DIAGNOSIS="$CI_DIAGNOSIS\n- BUILD ERRORS: Fix missing modules, import resolution, config issues"
+
             claude --permission-mode bypassPermissions --setting-sources project,local -p "You are working in an isolated git worktree for the ${REPO_NAME} project.
 Read CLAUDE.md for all project conventions.
 
-## CI Gate Failed — Fix These Errors
+## CI Gate Failed (attempt ${ATTEMPT}/${MAX_CI_RETRIES}) — Fix These Errors
 
-The CI gate (type-check, tests, build) failed after your implementation of ${IDENTIFIER}: ${TITLE}.
+The CI gate failed after implementation of ${IDENTIFIER}: ${TITLE}.
 
-Fix ALL failures below, even if they are unrelated to your changes. The CI gate must pass before we can push.
+### What was being implemented
+${DESCRIPTION}
+
+### ${CI_DIAGNOSIS}
+
+### Fix order (earlier fixes often resolve later errors):
+1. Import/module resolution
+2. Type errors
+3. Lint errors
+4. Test failures (fix implementation, NOT test assertions)
+5. Build errors
+
+## CRITICAL: Do NOT delete or gut features to make CI pass.
+The implementation must STILL address the issue requirements after your fixes.
+If a test is failing because the implementation is wrong, fix the implementation.
 
 ## CI Gate Output:
 \`\`\`
@@ -1530,7 +1609,7 @@ ${CI_ERRORS}
 - Run the failing commands yourself to verify fixes before committing
 - Commit fixes with a message like 'fix: resolve CI failures for ${IDENTIFIER}'
 - Do NOT push or open a PR
-- Do NOT modify files outside this worktree" --max-turns 500 >> "$ISSUE_LOG" 2>&1
+- Do NOT delete feature code to make CI pass" --max-turns 300 >> "$ISSUE_LOG" 2>&1
           else
             log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} CI gate FAILED after ${MAX_CI_RETRIES} attempts — not pushed"
 
@@ -1610,9 +1689,9 @@ Ready for re-review." >/dev/null 2>&1
             # Auto-review existing PR if enabled
             if [ "$AUTO_REVIEW" = true ]; then
               local REVIEW_VERDICT
-              REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER")
+              REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$TITLE" "$DESCRIPTION")
               if [ "$AUTO_FIX" = true ] && [ "$REVIEW_VERDICT" = "request_changes" ]; then
-                auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME"
+                auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME" "$TITLE" "$DESCRIPTION"
               fi
             fi
           else
@@ -1650,9 +1729,9 @@ Ready for human review." >/dev/null 2>&1
               # Auto-review new PR if enabled
               if [ "$AUTO_REVIEW" = true ]; then
                 local REVIEW_VERDICT
-                REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER")
+                REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$TITLE" "$DESCRIPTION")
                 if [ "$AUTO_FIX" = true ] && [ "$REVIEW_VERDICT" = "request_changes" ]; then
-                  auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME"
+                  auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME" "$TITLE" "$DESCRIPTION"
                 fi
               fi
             else
@@ -1686,9 +1765,9 @@ Ready for human review." >/dev/null 2>&1
         # Auto-review even without ci-gate
         if [ "$AUTO_REVIEW" = true ]; then
           local REVIEW_VERDICT
-          REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER")
+          REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$TITLE" "$DESCRIPTION")
           if [ "$AUTO_FIX" = true ] && [ "$REVIEW_VERDICT" = "request_changes" ]; then
-            auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME"
+            auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME" "$TITLE" "$DESCRIPTION"
           fi
         fi
       fi
