@@ -51,7 +51,7 @@ Stories estimated at 8+ should be broken down further.
 
 ### Orchestration markers
 
-For stories that involve multiple layers (backend + frontend + data), add `<!-- orchestrate -->` to the description. The orchestrator will decompose them further at implementation time.
+For stories that involve multiple layers (backend + frontend + data), note in the description that they should get the "Orchestrate" label. The orchestrator will decompose them further at implementation time.
 
 For single-layer stories, leave them unmarked — they'll run as single-agent tasks.
 

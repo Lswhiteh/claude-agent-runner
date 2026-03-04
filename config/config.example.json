@@ -7,6 +7,7 @@
   "ci_gate_path": "",
   "orchestrator": {
     "enabled": false,
+    "label": "Orchestrate",
     "auto": false,
     "max_subtasks": 8,
     "max_orchestrator_turns": 50,

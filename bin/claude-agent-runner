@@ -48,6 +48,7 @@ MAX_REVIEW_FIX_ITERATIONS=$(jq -r '.max_review_fix_iterations // 3' "$CONFIG")
 
 # Orchestrator config
 ORCH_ENABLED=$(jq -r '.orchestrator.enabled // false' "$CONFIG")
+ORCH_LABEL=$(jq -r '.orchestrator.label // "Orchestrate"' "$CONFIG")
 ORCH_AUTO=$(jq -r '.orchestrator.auto // false' "$CONFIG")
 ORCH_MAX_SUBTASKS=$(jq -r '.orchestrator.max_subtasks // 8' "$CONFIG")
 ORCH_MAX_TURNS=$(jq -r '.orchestrator.max_orchestrator_turns // 50' "$CONFIG")
@@ -495,6 +496,7 @@ fetch_agent_issues() {
           title
           description
           team { id name }
+          parent { id }
           labels { nodes { id name } }
           relations {
             nodes {
@@ -525,6 +527,7 @@ fetch_agent_issues() {
           title
           description
           team { id name }
+          parent { id }
           labels { nodes { id name } }
         }
       }
@@ -846,27 +849,26 @@ Make new commits. Do NOT push." --max-turns 200 >> "$LOG_DIR/${IDENTIFIER}-fix-c
 
 # --- Orchestrator (multi-agent decomposition) ---
 
-# Check if an issue should be orchestrated
+# Check if an issue should be orchestrated (by label)
 should_orchestrate() {
-  local DESCRIPTION="$1"
+  local ISSUE_JSON="$1"
 
-  # Never orchestrate a subtask (prevents infinite decomposition)
-  if echo "$DESCRIPTION" | grep -q '<!-- orchestrated-subtask -->'; then
-    return 1
-  fi
+  # Check if the issue has the orchestrate label
+  local HAS_ORCH_LABEL
+  HAS_ORCH_LABEL=$(echo "$ISSUE_JSON" | jq -r --arg label "$ORCH_LABEL" \
+    '.labels.nodes[]? | select(.name == $label) | .name' 2>/dev/null)
 
-  # Explicit marker
-  if echo "$DESCRIPTION" | grep -q '<!-- orchestrate -->'; then
-    return 0
-  fi
-
-  return 1
+  [ -n "$HAS_ORCH_LABEL" ]
 }
 
-# Check if an issue is an orchestrated subtask
+# Check if an issue is an orchestrated subtask (has a parent issue)
 is_orchestrated_subtask() {
-  local DESCRIPTION="$1"
-  echo "$DESCRIPTION" | grep -q '<!-- orchestrated-subtask -->'
+  local ISSUE_JSON="$1"
+
+  local HAS_PARENT
+  HAS_PARENT=$(echo "$ISSUE_JSON" | jq -r '.parent.id // empty' 2>/dev/null)
+
+  [ -n "$HAS_PARENT" ]
 }
 
 # Orchestrate a parent issue: decompose into sub-issues and supervise
@@ -972,9 +974,7 @@ Explore the codebase thoroughly before decomposing. Every file path in your scop
     ST_DEPS=$(jq -r '.depends_on // [] | join(", ")' "$subtask_file")
 
     # Build sub-issue description with scope metadata
-    local SUB_DESC="<!-- orchestrated-subtask -->
-
-## Subtask of ${IDENTIFIER}: ${TITLE}
+    local SUB_DESC="## Subtask of ${IDENTIFIER}: ${TITLE}
 
 ${ST_CONTEXT}
 
@@ -1577,7 +1577,7 @@ Output a markdown document compatible with the --pipeline command:
 - Each story has a title, estimate, labels, dependencies, and description
 - Stories should be sized for single agent sessions (1-3 hours)
 - Include acceptance criteria for each story
-- Mark multi-layer stories with <!-- orchestrate --> in their description"
+- Note which stories should get the 'Orchestrate' label for multi-agent decomposition"
 
   if [ "$INTERACTIVE" = true ]; then
     # Interactive mode — let Claude ask questions via stdin/stdout
@@ -1834,7 +1834,7 @@ Address every piece of feedback above. If something is unclear, create .claude/a
       if [ "$RESUMING" != true ]; then
 
         # --- Orchestration detection ---
-        if [ "$ORCH_ENABLED" = "true" ] && should_orchestrate "$DESCRIPTION"; then
+        if [ "$ORCH_ENABLED" = "true" ] && should_orchestrate "$issue"; then
           post_status "🧩 **Orchestrator starting** — decomposing into subtasks"
           slack_notify "$SLACK_WEBHOOK" "🧩 [${WORKSPACE}/${TEAM_NAME}] Orchestrator starting for ${IDENTIFIER}: ${TITLE}"
 
@@ -1849,7 +1849,7 @@ Address every piece of feedback above. If something is unclear, create .claude/a
         fi
 
         # --- Scoped worker detection ---
-        if is_orchestrated_subtask "$DESCRIPTION"; then
+        if is_orchestrated_subtask "$issue"; then
           post_status "🔧 **Scoped worker** — implementing subtask"
           slack_notify "$SLACK_WEBHOOK" "🔧 [${WORKSPACE}/${TEAM_NAME}] Scoped worker started ${IDENTIFIER}: ${TITLE}"
           run_scoped_worker "$WORKTREE" "$REPO_NAME" "$IDENTIFIER" "$TITLE" "$DESCRIPTION"
@@ -2337,7 +2337,7 @@ case "${1:-}" in
     echo "  6. You review the PR"
     echo ""
     echo "Orchestration (multi-agent):"
-    echo "  Add <!-- orchestrate --> to issue description to decompose into subtasks."
+    echo "  Add the '${ORCH_LABEL}' label to an issue to decompose into subtasks."
     echo "  Enable in config: orchestrator.enabled = true"
     echo "  The orchestrator decomposes, creates sub-issues, supervises workers,"
     echo "  validates results, and creates a combined PR."
