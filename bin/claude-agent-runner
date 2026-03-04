@@ -1228,7 +1228,9 @@ Do NOT push or open a PR." --max-turns 500 >> "$LOG_DIR/${WORKSPACE}-${IDENTIFIE
 
   # Phase 5: Create PR
   if [ "$INTEGRATION_PASSED" = true ]; then
-    local BRANCH="agent/${IDENTIFIER}"
+    local TITLE_SLUG
+    TITLE_SLUG=$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//' | cut -c1-50)
+    local BRANCH="agent/${IDENTIFIER}-${TITLE_SLUG}"
     git push -u origin "$BRANCH" 2>&1
 
     # Build PR body from all agent reports
@@ -1710,7 +1712,10 @@ run_agents_for_team() {
     DESCRIPTION=$(echo "$issue" | jq -r '.description // ""')
     TEAM_ID=$(echo "$issue" | jq -r '.team.id')
 
-    BRANCH="agent/${IDENTIFIER}"
+    # Slugify title: lowercase, replace non-alphanum with hyphens, trim, truncate
+    local TITLE_SLUG
+    TITLE_SLUG=$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//' | cut -c1-50)
+    BRANCH="agent/${IDENTIFIER}-${TITLE_SLUG}"
     WORKTREE_BASE="$HOME/.claude/worktrees/${REPO_NAME}"
     mkdir -p "$WORKTREE_BASE"
     WORKTREE="$WORKTREE_BASE/issue-${IDENTIFIER}"
