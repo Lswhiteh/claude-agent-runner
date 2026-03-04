@@ -793,6 +793,10 @@ auto_fix_loop() {
 
     # Export CLAUDE_AGENT_MODE for guardrail hook
     export CLAUDE_AGENT_MODE=1
+    export CLAUDE_AGENT_REPO="$REPO_NAME"
+    export CLAUDE_AGENT_BRANCH="$BRANCH"
+    export CLAUDE_AGENT_ISSUE_ID="$IDENTIFIER"
+    export CLAUDE_AGENT_WORKTREE="$WORKTREE"
 
     claude --permission-mode bypassPermissions --setting-sources project,local -p "You are working in an isolated git worktree for the ${REPO_NAME} project.
 Read CLAUDE.md for all project conventions.
@@ -898,6 +902,9 @@ orchestrate_issue() {
 
   # Phase 1: Spawn Claude to decompose the ticket
   export CLAUDE_AGENT_MODE=1
+  export CLAUDE_AGENT_REPO="$REPO_NAME"
+  export CLAUDE_AGENT_ISSUE_ID="$IDENTIFIER"
+  export CLAUDE_AGENT_WORKTREE="$WORKTREE"
   unset CLAUDECODE 2>/dev/null || true
 
   claude --permission-mode bypassPermissions --setting-sources project,local -p "You are an orchestrator decomposing a Linear issue into subtasks.
@@ -1313,6 +1320,9 @@ run_scoped_worker() {
   export CLAUDE_AGENT_SCOPED=1
   export CLAUDE_AGENT_SCOPE_FILE="$SCOPE_FILE"
   export CLAUDE_AGENT_MODE=1
+  export CLAUDE_AGENT_REPO="$REPO_NAME"
+  export CLAUDE_AGENT_ISSUE_ID="$IDENTIFIER"
+  export CLAUDE_AGENT_WORKTREE="$WORKTREE"
 
   unset CLAUDECODE 2>/dev/null || true
 
@@ -1746,6 +1756,10 @@ run_agents_for_team() {
 
       # Export CLAUDE_AGENT_MODE for guardrail hook
       export CLAUDE_AGENT_MODE=1
+      export CLAUDE_AGENT_REPO="$REPO_NAME"
+      export CLAUDE_AGENT_BRANCH="$BRANCH"
+      export CLAUDE_AGENT_ISSUE_ID="$IDENTIFIER"
+      export CLAUDE_AGENT_WORKTREE="$WORKTREE"
 
       # Track transient Linear comment IDs for cleanup
       TRANSIENT_COMMENTS_FILE="$LOG_DIR/${WORKSPACE}-${IDENTIFIER}-comments.tmp"

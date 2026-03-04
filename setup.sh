@@ -42,24 +42,95 @@ for hook in "$REPO_DIR/hooks/"*; do
   echo "  Linked: $NAME → $TARGET"
 done
 
-# Register hooks in settings.json
+# Register hooks in settings.json (correct nested format)
 SETTINGS="$HOME/.claude/settings.json"
+HOOKS_DIR="$HOME/.claude/hooks"
+
+# register_hook <event> <matcher> <hook_file> [async]
+# Adds a hook entry to settings.json using the correct nested format:
+#   hooks.<Event>[{matcher, hooks:[{type, command}]}]
+# Idempotent: skips if command path already present under the event.
+register_hook() {
+  local EVENT="$1"
+  local MATCHER="$2"
+  local HOOK_FILE="$3"
+  local ASYNC="${4:-false}"
+  local HOOK_PATH="$HOOKS_DIR/$HOOK_FILE"
+
+  # Check if already registered under this event
+  if jq -e ".hooks.\"$EVENT\"[]?.hooks[]? | select(.command == \"$HOOK_PATH\")" "$SETTINGS" >/dev/null 2>&1; then
+    echo "  Skipped: $HOOK_FILE already registered under $EVENT"
+    return 0
+  fi
+
+  # Build the hook entry
+  local HOOK_OBJ
+  if [ "$ASYNC" = "true" ]; then
+    HOOK_OBJ=$(jq -n --arg cmd "$HOOK_PATH" '{type: "command", command: $cmd, async: true}')
+  else
+    HOOK_OBJ=$(jq -n --arg cmd "$HOOK_PATH" '{type: "command", command: $cmd}')
+  fi
+
+  # Check if a matcher group already exists for this event+matcher
+  local MATCHER_EXISTS
+  MATCHER_EXISTS=$(jq -e ".hooks.\"$EVENT\"[]? | select(.matcher == \"$MATCHER\")" "$SETTINGS" 2>/dev/null || true)
+
+  if [ -n "$MATCHER_EXISTS" ]; then
+    # Append to existing matcher group's hooks array
+    jq "(.hooks.\"$EVENT\"[] | select(.matcher == \"$MATCHER\") | .hooks) += [$HOOK_OBJ]" \
+      "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+  else
+    # Create new matcher group
+    local GROUP
+    GROUP=$(jq -n --arg m "$MATCHER" --argjson h "[$HOOK_OBJ]" '{matcher: $m, hooks: $h}')
+    jq ".hooks.\"$EVENT\" = (.hooks.\"$EVENT\" // []) + [$GROUP]" \
+      "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+  fi
+
+  echo "  Registered $HOOK_FILE under $EVENT (matcher: ${MATCHER:-\"(all)\"})"
+}
+
 if [ -f "$SETTINGS" ] && command -v jq &>/dev/null; then
-  for HOOK_NAME in block-destructive.sh scope-guard.sh; do
-    HOOK_PATH="$HOME/.claude/hooks/$HOOK_NAME"
-    if ! jq -e '.hooks[] | select(.command == "'"$HOOK_PATH"'")' "$SETTINGS" >/dev/null 2>&1; then
-      HOOK_ENTRY="{\"type\": \"preToolUse\", \"matcher\": \"Bash\", \"command\": \"$HOOK_PATH\"}"
-      jq ".hooks = (.hooks // []) + [$HOOK_ENTRY]" "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
-      echo "  Registered $HOOK_NAME in settings.json"
-    else
-      echo "  Skipped: $HOOK_NAME already registered in settings.json"
-    fi
-  done
+  # Ensure hooks object exists
+  if ! jq -e '.hooks' "$SETTINGS" >/dev/null 2>&1; then
+    jq '. + {hooks: {}}' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+  fi
+
+  # Migrate old flat-format hooks if present (pre-v2 format)
+  if jq -e '.hooks | type == "array"' "$SETTINGS" >/dev/null 2>&1; then
+    echo "  Migrating old flat-format hooks to nested format..."
+    jq '.hooks = {}' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+  fi
+
+  # --- PreToolUse:Bash hooks ---
+  register_hook "PreToolUse" "Bash" "block-destructive.sh"
+  register_hook "PreToolUse" "Bash" "scope-guard.sh"
+  register_hook "PreToolUse" "Bash" "command-budget.sh"
+  register_hook "PreToolUse" "Bash" "command-rewriter.sh"
+
+  # --- PostToolUse:Edit|Write (async) ---
+  register_hook "PostToolUse" "Edit|Write" "auto-lint.sh" "true"
+
+  # --- PostToolUseFailure:Bash ---
+  register_hook "PostToolUseFailure" "Bash" "rtk-failure-hint.sh"
+
+  # --- SessionStart ---
+  register_hook "SessionStart" "" "session-context.sh"
+
+  # --- Stop ---
+  register_hook "Stop" "" "stop-gate.sh"
+
+  # --- SubagentStop ---
+  register_hook "SubagentStop" "" "subagent-collector.sh"
+
+  # --- TaskCompleted ---
+  register_hook "TaskCompleted" "" "task-validator.sh"
+
+  # --- PreCompact ---
+  register_hook "PreCompact" "" "pre-compact.sh"
 else
   echo "  WARNING: Could not register hooks — settings.json not found or jq not installed"
-  echo "  Manually add to ~/.claude/settings.json hooks array:"
-  echo "    {\"type\": \"preToolUse\", \"matcher\": \"Bash\", \"command\": \"$HOME/.claude/hooks/block-destructive.sh\"}"
-  echo "    {\"type\": \"preToolUse\", \"matcher\": \"Bash\", \"command\": \"$HOME/.claude/hooks/scope-guard.sh\"}"
+  echo "  Create ~/.claude/settings.json with {\"hooks\": {}} and re-run setup.sh"
 fi
 
 # --- skills/ → ~/.claude/skills/ ---
@@ -120,7 +191,7 @@ echo "=== Done! ==="
 echo ""
 echo "What was set up:"
 echo "  ~/.local/bin/              ← claude-agent-runner, ci-gate"
-echo "  ~/.claude/hooks/           ← block-destructive.sh, scope-guard.sh (guardrails)"
+echo "  ~/.claude/hooks/           ← 11 hooks (guardrails, linting, budget, context, ...)"
 echo "  ~/.claude/skills/          ← agent skills (implement, orchestrate, scoped-worker, ...)"
 echo "  ~/.config/claude-agents/   ← config, secrets, logs, locks"
 echo ""

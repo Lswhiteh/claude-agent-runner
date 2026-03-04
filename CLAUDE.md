@@ -10,8 +10,17 @@ bin/
   ci-gate                   Deterministic CI checks before push
 
 hooks/
-  block-destructive.sh      PreToolUse guardrail (blocks rm -rf, force-push, etc. in agent mode)
-  scope-guard.sh            PreToolUse guardrail (enforces file scope when CLAUDE_AGENT_SCOPED=1)
+  block-destructive.sh      PreToolUse:Bash — blocks rm -rf, force-push, etc. (CLAUDE_AGENT_MODE=1)
+  scope-guard.sh            PreToolUse:Bash — enforces file scope (CLAUDE_AGENT_SCOPED=1)
+  command-budget.sh         PreToolUse:Bash — denies after N commands (CLAUDE_AGENT_MODE=1)
+  command-rewriter.sh       PreToolUse:Bash — adds --save-exact to npm install (CLAUDE_AGENT_MODE=1)
+  auto-lint.sh              PostToolUse:Edit|Write — async linting on file changes (CLAUDE_AGENT_MODE=1)
+  rtk-failure-hint.sh       PostToolUseFailure:Bash — suggests rtk proxy on failure
+  session-context.sh        SessionStart — injects agent identity context (CLAUDE_AGENT_MODE=1)
+  stop-gate.sh              Stop — blocks finish if no test evidence (CLAUDE_AGENT_MODE=1)
+  subagent-collector.sh     SubagentStop — logs subagent results (CLAUDE_AGENT_SCOPED=1)
+  task-validator.sh         TaskCompleted — blocks task completion without tests (CLAUDE_AGENT_MODE=1)
+  pre-compact.sh            PreCompact — saves git state snapshot (CLAUDE_AGENT_MODE=1)
 
 skills/                     Claude Code skills for agent use
   agent-report/             Implementation summary generation
@@ -53,6 +62,7 @@ setup.sh                    One-command install: symlinks, hooks, skills, config
 - **Orchestration**: Decomposes issues with "Orchestrate" label into scoped sub-issues, supervises workers, runs integration validation, creates combined PR
 - **Scoped workers**: Sub-issues of orchestrated parents run with file scope enforcement via scope-guard hook
 - **Guardrails**: Exports CLAUDE_AGENT_MODE=1 for block-destructive.sh; CLAUDE_AGENT_SCOPED=1 for scope-guard.sh
+- **Agent identity**: Exports CLAUDE_AGENT_ISSUE_ID, CLAUDE_AGENT_REPO, CLAUDE_AGENT_BRANCH, CLAUDE_AGENT_WORKTREE at all claude invocation sites
 
 ### ci-gate
 - Reads `.ci-gate` file if present, otherwise auto-detects project type
@@ -71,6 +81,52 @@ setup.sh                    One-command install: symlinks, hooks, skills, config
 - Allows reads anywhere, always allows writes to `.claude/orchestrator/`, `.claude/agent-reports/`, `.claude/agent-blocked/`
 - Test: `echo '{"tool_input":{"command":"echo > bad.ts"}}' | CLAUDE_AGENT_SCOPED=1 CLAUDE_AGENT_SCOPE_FILE=subtask.json bash hooks/scope-guard.sh`
 
+### command-budget.sh
+- PreToolUse:Bash hook, only active when CLAUDE_AGENT_MODE=1
+- Tracks Bash calls per session via counter file at `/tmp/claude-agent-budget-<session_id>`
+- Denies at threshold (default 300, override with $CLAUDE_AGENT_CMD_BUDGET)
+
+### command-rewriter.sh
+- PreToolUse:Bash hook, only active when CLAUDE_AGENT_MODE=1
+- Rewrites `npm install <packages>` to include `--save-exact`
+- Skips bare `npm install`, `npm ci`, and commands that already have `--save-exact`
+
+### auto-lint.sh
+- PostToolUse:Edit|Write hook (async), only active when CLAUDE_AGENT_MODE=1
+- Runs eslint (ts/js) or ruff (py) on edited files
+- Non-blocking: output delivered as context on next turn
+
+### rtk-failure-hint.sh
+- PostToolUseFailure:Bash hook, no gate (useful everywhere)
+- When `rtk <cmd>` fails, suggests re-running with `rtk proxy <cmd>`
+
+### session-context.sh
+- SessionStart hook, only active when CLAUDE_AGENT_MODE=1
+- Reads CLAUDE_AGENT_ISSUE_ID, CLAUDE_AGENT_REPO, CLAUDE_AGENT_BRANCH, CLAUDE_AGENT_WORKTREE
+- Outputs agent identity as additionalContext
+- Persists env vars to $CLAUDE_ENV_FILE if available
+
+### stop-gate.sh
+- Stop hook, only active when CLAUDE_AGENT_MODE=1
+- Parses transcript for CI/test evidence (ci-gate, npm test, pytest, cargo test, vitest, jest, go test)
+- Blocks stop if no test evidence found
+- Uses CLAUDE_STOP_HOOK_ACTIVE guard to prevent infinite loops
+
+### task-validator.sh
+- TaskCompleted hook, only active when CLAUDE_AGENT_MODE=1
+- Same transcript parsing as stop-gate
+- Exit 2 + stderr to block task completion without test evidence
+
+### subagent-collector.sh
+- SubagentStop hook, only active when CLAUDE_AGENT_SCOPED=1
+- Appends JSONL entries to `.claude/orchestrator/subagent-log.jsonl`
+- Pure logging, no blocking
+
+### pre-compact.sh
+- PreCompact hook, only active when CLAUDE_AGENT_MODE=1
+- Saves git state snapshot to `.claude/agent-state/compact-snapshot-<timestamp>.md`
+- Non-blocking (PreCompact cannot prevent compaction)
+
 ## Conventions
 
 - All scripts use `set -uo pipefail` (not `-e` for agent runner since subshells handle errors)
@@ -84,7 +140,7 @@ setup.sh                    One-command install: symlinks, hooks, skills, config
 
 - When modifying the agent runner: functions are organized by section (Linear API, GitHub, Slack, DB, worktree, review, fix, orchestrator, pipeline, spec, main loop, CLI)
 - When modifying ci-gate: each language block is self-contained
-- When modifying block-destructive.sh: test with `echo '{"tool_input":{"command":"rm -rf /"}}' | CLAUDE_AGENT_MODE=1 bash hooks/block-destructive.sh`
-- When modifying scope-guard.sh: test with `echo '{"tool_input":{"command":"echo > file.ts"}}' | CLAUDE_AGENT_SCOPED=1 CLAUDE_AGENT_SCOPE_FILE=subtask.json bash hooks/scope-guard.sh`
+- When modifying hooks: test with `echo '<JSON>' | ENV_VAR=1 bash hooks/<hook>.sh` (see each hook's header for test command)
+- All hooks use the gate pattern: check env var, exit 0 early if inactive
 - setup.sh must remain idempotent — always check before overwriting
 - Orchestration detection uses Linear labels (not description markers) — `Orchestrate` label triggers decomposition, `parent.id` field identifies subtasks
