@@ -1261,6 +1261,7 @@ Closes ${IDENTIFIER}"
 
     local PR_URL
     PR_URL=$(gh pr create \
+      --draft \
       --title "${IDENTIFIER}: ${TITLE}" \
       --body "$PR_BODY" \
       --head "$BRANCH" \
@@ -2146,6 +2147,7 @@ Closes ${IDENTIFIER}"
             fi
 
             PR_URL=$(gh pr create \
+              --draft \
               --title "${IDENTIFIER}: ${TITLE}" \
               --body "$PR_BODY" \
               --head "$BRANCH" \
@@ -2187,6 +2189,7 @@ Ready for human review." >/dev/null 2>&1
           slack_notify "$SLACK_WEBHOOK" "✅ [${WORKSPACE}/${TEAM_NAME}] ${IDENTIFIER} feedback addressed — PR updated: ${EXISTING_PR}"
         else
           PR_URL=$(gh pr create \
+            --draft \
             --title "${IDENTIFIER}: ${TITLE}" \
             --body "${IDENTIFIER}: ${TITLE} — implemented by autonomous Claude agent." \
             --head "$BRANCH" --base main 2>&1 | tail -1 | grep -oE 'https://github\.com/[^ ]+')
