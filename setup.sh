@@ -42,23 +42,24 @@ for hook in "$REPO_DIR/hooks/"*; do
   echo "  Linked: $NAME → $TARGET"
 done
 
-# Register block-destructive.sh in settings.json
+# Register hooks in settings.json
 SETTINGS="$HOME/.claude/settings.json"
-HOOK_PATH="$HOME/.claude/hooks/block-destructive.sh"
 if [ -f "$SETTINGS" ] && command -v jq &>/dev/null; then
-  # Check if hook is already registered
-  if ! jq -e '.hooks[] | select(.command == "'"$HOOK_PATH"'")' "$SETTINGS" >/dev/null 2>&1; then
-    # Add the hook via jq merge
-    HOOK_ENTRY="{\"type\": \"preToolUse\", \"matcher\": \"Bash\", \"command\": \"$HOOK_PATH\"}"
-    jq ".hooks = (.hooks // []) + [$HOOK_ENTRY]" "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
-    echo "  Registered block-destructive.sh in settings.json"
-  else
-    echo "  Skipped: block-destructive.sh already registered in settings.json"
-  fi
+  for HOOK_NAME in block-destructive.sh scope-guard.sh; do
+    HOOK_PATH="$HOME/.claude/hooks/$HOOK_NAME"
+    if ! jq -e '.hooks[] | select(.command == "'"$HOOK_PATH"'")' "$SETTINGS" >/dev/null 2>&1; then
+      HOOK_ENTRY="{\"type\": \"preToolUse\", \"matcher\": \"Bash\", \"command\": \"$HOOK_PATH\"}"
+      jq ".hooks = (.hooks // []) + [$HOOK_ENTRY]" "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+      echo "  Registered $HOOK_NAME in settings.json"
+    else
+      echo "  Skipped: $HOOK_NAME already registered in settings.json"
+    fi
+  done
 else
-  echo "  WARNING: Could not register hook — settings.json not found or jq not installed"
+  echo "  WARNING: Could not register hooks — settings.json not found or jq not installed"
   echo "  Manually add to ~/.claude/settings.json hooks array:"
-  echo "    {\"type\": \"preToolUse\", \"matcher\": \"Bash\", \"command\": \"$HOOK_PATH\"}"
+  echo "    {\"type\": \"preToolUse\", \"matcher\": \"Bash\", \"command\": \"$HOME/.claude/hooks/block-destructive.sh\"}"
+  echo "    {\"type\": \"preToolUse\", \"matcher\": \"Bash\", \"command\": \"$HOME/.claude/hooks/scope-guard.sh\"}"
 fi
 
 # --- skills/ → ~/.claude/skills/ ---
@@ -119,8 +120,8 @@ echo "=== Done! ==="
 echo ""
 echo "What was set up:"
 echo "  ~/.local/bin/              ← claude-agent-runner, ci-gate"
-echo "  ~/.claude/hooks/           ← block-destructive.sh (guardrail)"
-echo "  ~/.claude/skills/          ← 10 agent skills"
+echo "  ~/.claude/hooks/           ← block-destructive.sh, scope-guard.sh (guardrails)"
+echo "  ~/.claude/skills/          ← agent skills (implement, orchestrate, scoped-worker, ...)"
 echo "  ~/.config/claude-agents/   ← config, secrets, logs, locks"
 echo ""
 echo "Remaining manual steps:"

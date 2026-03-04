@@ -5,6 +5,14 @@
   "max_ci_retries": 3,
   "max_review_fix_iterations": 3,
   "ci_gate_path": "",
+  "orchestrator": {
+    "enabled": false,
+    "auto": false,
+    "max_subtasks": 8,
+    "max_orchestrator_turns": 50,
+    "poll_interval_seconds": 30,
+    "max_validation_retries": 2
+  },
   "workspaces": {
     "example": {
       "api_key_env": "LINEAR_API_KEY_EXAMPLE",
