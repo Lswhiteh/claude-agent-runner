@@ -77,6 +77,23 @@ if [ -f "package.json" ]; then
     fi
   fi
 
+  # Lint (if configured)
+  if (cd "$APP_DIR" && jq -e '.scripts.lint' package.json >/dev/null 2>&1); then
+    log "Linting..."
+    if (cd "$APP_DIR" && npm run lint 2>&1); then
+      pass "Lint"
+    else
+      fail "Lint"
+    fi
+  elif (cd "$APP_DIR" && [ -f ".eslintrc" ] || [ -f ".eslintrc.js" ] || [ -f ".eslintrc.json" ] || [ -f "eslint.config.js" ] || [ -f "eslint.config.mjs" ]); then
+    log "Linting (auto-detected eslint)..."
+    if (cd "$APP_DIR" && npx eslint . --max-warnings 0 2>&1); then
+      pass "Lint (eslint)"
+    else
+      fail "Lint (eslint)"
+    fi
+  fi
+
   # Build — detect framework
   log "Building..."
   if (cd "$APP_DIR" && grep -q '"next"' package.json 2>/dev/null); then
@@ -127,6 +144,31 @@ elif [ -f "go.mod" ]; then
 
 else
   log "Unknown project type — skipping default checks"
+fi
+
+# --- Secret detection (language-agnostic) ---
+log "Checking for leaked secrets in staged changes..."
+SECRET_PATTERNS='(sk-ant-[a-zA-Z0-9_-]+|sk-[a-zA-Z0-9]{48}|AKIA[0-9A-Z]{16}|ghp_[a-zA-Z0-9]{36}|glpat-[a-zA-Z0-9_-]{20}|xox[baprs]-[a-zA-Z0-9-]+|-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----)'
+CHANGED_FILES=$(git diff --name-only origin/main 2>/dev/null || git diff --name-only HEAD~1 2>/dev/null || echo "")
+if [ -n "$CHANGED_FILES" ]; then
+  SECRETS_FOUND=""
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    # Skip binary files, lock files, and known safe patterns
+    case "$f" in
+      *.lock|*.png|*.jpg|*.gif|*.ico|*.woff*|*.ttf|*.eot|*.svg) continue ;;
+    esac
+    MATCH=$(grep -nEo "$SECRET_PATTERNS" "$f" 2>/dev/null | head -3)
+    if [ -n "$MATCH" ]; then
+      SECRETS_FOUND="${SECRETS_FOUND}\n  ${f}: ${MATCH}"
+    fi
+  done <<< "$CHANGED_FILES"
+
+  if [ -n "$SECRETS_FOUND" ]; then
+    fail "Potential secrets detected in changed files:${SECRETS_FOUND}"
+  else
+    pass "No secrets detected"
+  fi
 fi
 
 if [ "$FAILED" -eq 0 ]; then

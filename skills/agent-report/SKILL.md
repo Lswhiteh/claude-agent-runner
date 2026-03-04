@@ -45,6 +45,16 @@ mkdir -p .claude/agent-reports
 - [Test file locations]
 - [Coverage notes — what's covered, what isn't]
 
+## Root Cause Analysis (bug fixes only)
+- **Root cause**: [1-2 sentence summary of WHY the bug existed]
+- **Failure chain**: symptom → immediate cause → root cause
+- **RCA document**: `.claude/rca/<IDENTIFIER>.md`
+- **Regression test**: [Test file and name that prevents recurrence]
+
+## Verification
+- **Requirements met**: [X/Y requirements satisfied — reference .claude/verify/<IDENTIFIER>.md]
+- **Gaps**: [Any requirements not fully addressed and why]
+
 ## CI gate results
 - Type check: PASS/FAIL
 - Tests: PASS/FAIL (X passing, Y failing)

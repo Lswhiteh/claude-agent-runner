@@ -568,6 +568,8 @@ auto_review_pr() {
   local REPO_DIR="$1"
   local BRANCH="$2"
   local IDENTIFIER="$3"
+  local ISSUE_TITLE="${4:-}"
+  local ISSUE_DESCRIPTION="${5:-}"
 
   cd "$REPO_DIR" || return 1
 
@@ -587,6 +589,16 @@ auto_review_pr() {
   PR_TITLE=$(gh pr view "$BRANCH" --json title --jq '.title' 2>/dev/null)
   PR_BODY=$(gh pr view "$BRANCH" --json body --jq '.body' 2>/dev/null)
 
+  # Build issue context section if available
+  local ISSUE_CONTEXT=""
+  if [ -n "$ISSUE_TITLE" ] || [ -n "$ISSUE_DESCRIPTION" ]; then
+    ISSUE_CONTEXT="### Original Issue: ${IDENTIFIER}
+**Title:** ${ISSUE_TITLE}
+**Description:**
+${ISSUE_DESCRIPTION}
+"
+  fi
+
   # Create a temp file for the review prompt
   local REVIEW_PROMPT
   REVIEW_PROMPT=$(mktemp)
@@ -598,6 +610,8 @@ You are a senior code reviewer. Review this PR thoroughly.
 ### Description
 ${PR_BODY}
 
+${ISSUE_CONTEXT}
+
 ### Diff
 \`\`\`diff
 ${DIFF}
@@ -608,6 +622,7 @@ Review the code and output ONLY a JSON object with this exact structure:
 {
   "verdict": "approve" | "request_changes" | "comment",
   "summary": "1-2 sentence overall assessment",
+  "requirements_coverage": "Does the PR address all requirements from the issue? List any gaps.",
   "blocking": ["list of issues that MUST be fixed before merge"],
   "important": ["list of issues that SHOULD be fixed"],
   "nits": ["minor style/preference suggestions"],
@@ -616,6 +631,7 @@ Review the code and output ONLY a JSON object with this exact structure:
 
 Rules:
 - Only use "request_changes" for genuine bugs, security issues, or broken functionality
+- Check requirements_coverage: if the PR doesn't implement what the issue asked for, that's blocking
 - Style preferences and minor improvements should be "nits" or "important", not blocking
 - Be specific — reference file names and line numbers
 - Output ONLY the JSON, no markdown fences, no extra text
@@ -642,9 +658,19 @@ REVIEW_EOF
     IMPORTANT=$(echo "$REVIEW_OUTPUT" | jq -r '.important // [] | map("- **Important**: " + .) | join("\n")' 2>/dev/null)
     NITS=$(echo "$REVIEW_OUTPUT" | jq -r '.nits // [] | map("- _Nit_: " + .) | join("\n")' 2>/dev/null)
     PRAISE=$(echo "$REVIEW_OUTPUT" | jq -r '.praise // [] | map("- :thumbsup: " + .) | join("\n")' 2>/dev/null)
+    local REQ_COVERAGE
+    REQ_COVERAGE=$(echo "$REVIEW_OUTPUT" | jq -r '.requirements_coverage // ""' 2>/dev/null)
+
+    local REQ_SECTION=""
+    if [ -n "$REQ_COVERAGE" ]; then
+      REQ_SECTION="### Requirements Coverage
+${REQ_COVERAGE}
+"
+    fi
 
     REVIEW_BODY="## Auto-Review: ${SUMMARY}
 
+${REQ_SECTION}
 ${BLOCKING}
 ${IMPORTANT}
 ${NITS}
@@ -691,6 +717,8 @@ auto_fix_loop() {
   local BRANCH="$3"
   local IDENTIFIER="$4"
   local REPO_NAME="$5"
+  local ISSUE_TITLE="${6:-}"
+  local ISSUE_DESCRIPTION="${7:-}"
 
   cd "$WORKTREE" || return 1
 
@@ -768,7 +796,7 @@ Make new commits. Do NOT push." --max-turns 200 >> "$LOG_DIR/${IDENTIFIER}-fix-c
 
     # Re-run auto-review
     local NEW_VERDICT
-    NEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER")
+    NEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$ISSUE_TITLE" "$ISSUE_DESCRIPTION")
 
     if [ "$NEW_VERDICT" = "approve" ]; then
       log "[auto-fix] PR approved after fix iteration ${ITER}"
@@ -1190,11 +1218,125 @@ Address every piece of feedback above. If something is unclear, create .claude/a
       fi
 
       if [ "$RESUMING" != true ]; then
-        post_status "🔧 **Agent working** — starting implementation"
-        slack_notify "$SLACK_WEBHOOK" "🔧 [${WORKSPACE}/${TEAM_NAME}] Agent started ${IDENTIFIER}: ${TITLE}"
 
-        claude --permission-mode bypassPermissions --setting-sources project,local -p "You are working in an isolated git worktree for the ${REPO_NAME} project.
+        # --- Phase 0: Pre-flight triage ---
+        post_status "🔍 **Pre-flight check** — triaging issue before implementation"
+        log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} running pre-flight triage"
+
+        PREFLIGHT_OUTPUT=$(claude --permission-mode plan --print --setting-sources project,local -p "You are assessing a Linear issue BEFORE implementation begins. You are in the ${REPO_NAME} project.
+Read CLAUDE.md for project context.
+
+Use the preflight skill workflow: classify the issue type, check if requirements are sufficient, and assess complexity/risk.
+
+## Linear Issue: ${IDENTIFIER}
+**Title:** ${TITLE}
+
+**Description:**
+${DESCRIPTION}
+
+Output ONLY a JSON object with these fields:
+- type: bug | feature | refactor | chore | unclear
+- verdict: proceed | block
+- complexity: low | medium | high
+- risk: low | medium | high
+- skills: [list of recommended skills]
+- notes: brief assessment
+- block_reason: only if verdict is block
+- block_questions: only if verdict is block" --max-turns 10 2>/dev/null || echo '{"type":"feature","verdict":"proceed"}')
+
+        # Parse pre-flight results
+        ISSUE_TYPE=$(echo "$PREFLIGHT_OUTPUT" | jq -r '.type // "feature"' 2>/dev/null || echo "feature")
+        PREFLIGHT_VERDICT=$(echo "$PREFLIGHT_OUTPUT" | jq -r '.verdict // "proceed"' 2>/dev/null || echo "proceed")
+        PREFLIGHT_NOTES=$(echo "$PREFLIGHT_OUTPUT" | jq -r '.notes // ""' 2>/dev/null || echo "")
+        ISSUE_COMPLEXITY=$(echo "$PREFLIGHT_OUTPUT" | jq -r '.complexity // "medium"' 2>/dev/null || echo "medium")
+
+        # Adaptive turn budget based on complexity and type
+        case "$ISSUE_COMPLEXITY" in
+          low)  IMPL_TURNS=200 ;;
+          high) IMPL_TURNS=800 ;;
+          *)    IMPL_TURNS=500 ;;
+        esac
+        # Bug fixes with RCA need more turns for investigation
+        if [ "$ISSUE_TYPE" = "bug" ]; then
+          IMPL_TURNS=$((IMPL_TURNS + 100))
+        fi
+        log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} turn budget: ${IMPL_TURNS} (complexity: ${ISSUE_COMPLEXITY}, type: ${ISSUE_TYPE})"
+
+        if [ "$PREFLIGHT_VERDICT" = "block" ]; then
+          BLOCK_REASON=$(echo "$PREFLIGHT_OUTPUT" | jq -r '.block_reason // "Requirements insufficient"' 2>/dev/null)
+          BLOCK_QUESTIONS=$(echo "$PREFLIGHT_OUTPUT" | jq -r '.block_questions // [] | join("\n")' 2>/dev/null)
+
+          mkdir -p .claude/agent-blocked
+          cat > ".claude/agent-blocked/${IDENTIFIER}.md" << BLOCK_EOF
+# Blocked: ${IDENTIFIER} (pre-flight)
+
+## Reason
+${BLOCK_REASON}
+
+## Questions
+${BLOCK_QUESTIONS}
+
+## Pre-flight Assessment
+${PREFLIGHT_NOTES}
+BLOCK_EOF
+          git add ".claude/agent-blocked/${IDENTIFIER}.md"
+          git commit -m "chore: agent blocked on ${IDENTIFIER} — pre-flight flagged insufficient requirements" 2>/dev/null
+
+          log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} blocked at pre-flight: ${BLOCK_REASON}"
+          # Fall through to blocked detection below
+        fi
+
+        # Read cross-run learnings if they exist
+        LEARNINGS=""
+        if [ -f ".claude/learnings.md" ]; then
+          LEARNINGS=$(cat ".claude/learnings.md")
+        fi
+
+        LEARNINGS_SECTION=""
+        if [ -n "$LEARNINGS" ]; then
+          LEARNINGS_SECTION="
+## Cross-Run Learnings (from previous agent sessions)
+Read these carefully — they contain hard-won knowledge about this codebase:
+
+${LEARNINGS}
+"
+        fi
+
+        # --- Phase 1: Implementation (bug-aware prompting) ---
+        if [ ! -f ".claude/agent-blocked/${IDENTIFIER}.md" ]; then
+          post_status "🔧 **Agent working** — starting implementation (type: ${ISSUE_TYPE})"
+          slack_notify "$SLACK_WEBHOOK" "🔧 [${WORKSPACE}/${TEAM_NAME}] Agent started ${IDENTIFIER}: ${TITLE} (type: ${ISSUE_TYPE})"
+
+          # Build type-specific workflow instructions
+          if [ "$ISSUE_TYPE" = "bug" ]; then
+            WORKFLOW_INSTRUCTIONS="## Workflow: Bug Fix (RCA-First)
+
+This issue has been classified as a **bug fix**. You MUST follow the RCA (Root Cause Analysis) workflow:
+
+1. **Use the \`rca\` skill** — this is MANDATORY for all bug fixes
+2. Reproduce the bug with a failing test BEFORE writing any fix
+3. Trace the failure chain: symptom → immediate cause → root cause
+4. Document the root cause in \`.claude/rca/${IDENTIFIER}.md\`
+5. Apply a minimal, targeted fix that addresses the ROOT CAUSE
+6. Verify the reproduction test now passes
+7. Check for blast radius — did the fix break anything else?
+
+DO NOT skip the RCA document. DO NOT fix symptoms without understanding the root cause.
+DO NOT start coding a fix until you have a documented hypothesis."
+          else
+            WORKFLOW_INSTRUCTIONS="## Workflow: Implementation
+
+1. **Read CLAUDE.md** and explore the relevant codebase before writing anything
+2. **Plan**: Identify all files that need to change, draft your approach
+3. **Tests first**: Write failing tests, verify they fail
+4. **Implement**: Minimum code to make tests pass
+5. **Validate**: Run full test suite"
+          fi
+
+          claude --permission-mode bypassPermissions --setting-sources project,local -p "You are working in an isolated git worktree for the ${REPO_NAME} project.
 Read CLAUDE.md for all project conventions, architecture, and coding standards.
+${LEARNINGS_SECTION}
+${WORKFLOW_INSTRUCTIONS}
 
 ## Your Task
 Implement the following Linear issue. Write tests where appropriate.
@@ -1229,21 +1371,31 @@ AND the blocked file together.
 **Description:**
 ${DESCRIPTION}
 
-## Documentation Requirements (MANDATORY)
-After implementation, you MUST update project documentation:
+## Pre-flight Assessment
+Type: ${ISSUE_TYPE}
+${PREFLIGHT_NOTES}
 
-1. **CHANGELOG or relevant docs**: If the project has a CHANGELOG.md, docs/ directory,
-   or similar, add an entry describing what was implemented and any decisions made.
+## Post-Implementation Requirements (MANDATORY)
 
-2. **Architecture/schema docs**: If you changed database schema, API contracts, or
-   component architecture, update the corresponding docs (e.g., docs/database/schema/,
-   API docs, component docs).
+### 1. Verification (use the \`verify\` skill)
+Before you consider your work done, run the verify workflow:
+- Extract requirements from the issue
+- Check each requirement against your diff
+- Flag any gaps or missing edge cases
+- Write \`.claude/verify/${IDENTIFIER}.md\` with the results
+- Fix any gaps found, then re-verify
 
-3. **CLAUDE.md**: If you discovered a new convention, gotcha, or hard-won rule during
-   implementation, add it to the project's CLAUDE.md so future agents benefit.
+### 2. Learnings (use the \`learnings\` skill)
+If you discovered anything non-obvious about this codebase during implementation
+(gotchas, quirks, constraints, patterns), append it to \`.claude/learnings.md\`.
 
-4. **Implementation summary**: Create a file at \`.claude/agent-reports/${IDENTIFIER}.md\`
-   with this structure:
+### 3. Documentation
+- **CHANGELOG or relevant docs**: Add entries for what changed
+- **Architecture/schema docs**: Update if you changed DB schema, API contracts, etc.
+- **CLAUDE.md**: Add any new conventions or hard-won rules you discovered
+
+### 4. Implementation Report
+Create \`.claude/agent-reports/${IDENTIFIER}.md\` with this structure:
 
    # ${IDENTIFIER}: ${TITLE}
 
@@ -1262,9 +1414,17 @@ After implementation, you MUST update project documentation:
    ## Tests
    [What was tested and coverage notes]
 
+$([ "$ISSUE_TYPE" = "bug" ] && echo "   ## Root Cause Analysis
+   [Summary of the root cause — reference .claude/rca/${IDENTIFIER}.md for details]
+   [Failure chain: symptom → immediate cause → root cause]")
+
+   ## Verification
+   [Reference .claude/verify/${IDENTIFIER}.md — were all requirements met?]
+
 Commit all documentation updates as part of your work.
 
-Do NOT modify files outside this worktree." --max-turns 500
+Do NOT modify files outside this worktree." --max-turns "$IMPL_TURNS"
+        fi
       fi
 
       # Save session ID for potential resume
@@ -1275,6 +1435,13 @@ Do NOT modify files outside this worktree." --max-turns 500
         if [ -n "$LATEST_SESSION" ]; then
           echo "$LATEST_SESSION" > "$SESSION_FILE"
         fi
+      fi
+
+      # --- Checkpoint: tag post-implementation state for rollback ---
+      IMPL_COMMIT_COUNT=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo "0")
+      if [ "$IMPL_COMMIT_COUNT" -gt 0 ]; then
+        git tag -f "checkpoint/${IDENTIFIER}/post-impl" HEAD 2>/dev/null
+        log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} checkpoint tagged (${IMPL_COMMIT_COUNT} commits)"
       fi
 
       # --- Check if agent is blocked ---
@@ -1308,6 +1475,69 @@ Check the agent log for details: \`$ISSUE_LOG\`" >/dev/null 2>&1
         exit 0
       fi
 
+      # --- Self-review gate (catch issues before expensive CI) ---
+      post_status "🔎 **Self-review** — checking implementation completeness before CI"
+      log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} running self-review gate"
+
+      SELF_REVIEW_OUTPUT=$(claude --permission-mode plan --print --setting-sources project,local -p "You are reviewing an agent's implementation BEFORE CI runs. This is the ${REPO_NAME} project.
+
+## Issue: ${IDENTIFIER} — ${TITLE}
+Type: ${ISSUE_TYPE:-feature}
+
+## Description
+${DESCRIPTION}
+
+## Changes Made
+\`\`\`
+$(git diff --stat origin/main 2>/dev/null)
+\`\`\`
+
+## Commit Log
+\`\`\`
+$(git log --oneline origin/main..HEAD 2>/dev/null)
+\`\`\`
+
+## Quick Checks
+Answer each with PASS or FAIL and a brief reason:
+
+1. **Requirements coverage**: Do the commits appear to address the issue?
+2. **RCA document** (bugs only): Does .claude/rca/${IDENTIFIER}.md exist? $([ -f ".claude/rca/${IDENTIFIER}.md" ] && echo 'YES — file exists' || echo 'NO — file missing')
+3. **Verification report**: Does .claude/verify/${IDENTIFIER}.md exist? $([ -f ".claude/verify/${IDENTIFIER}.md" ] && echo 'YES — file exists' || echo 'NO — file missing')
+4. **Tests added**: Were new test files or test cases committed?
+5. **Agent report**: Does .claude/agent-reports/${IDENTIFIER}.md exist? $([ -f ".claude/agent-reports/${IDENTIFIER}.md" ] && echo 'YES — file exists' || echo 'NO — file missing')
+6. **No debug artifacts**: No console.log/print debugging, no TODO without ticket refs?
+
+Output ONLY a JSON object:
+{
+  \"verdict\": \"pass\" | \"needs_work\",
+  \"issues\": [\"list of specific issues to fix\"],
+  \"summary\": \"1-2 sentence assessment\"
+}" --max-turns 10 2>/dev/null || echo '{"verdict":"pass"}')
+
+      SELF_REVIEW_VERDICT=$(echo "$SELF_REVIEW_OUTPUT" | jq -r '.verdict // "pass"' 2>/dev/null || echo "pass")
+
+      if [ "$SELF_REVIEW_VERDICT" = "needs_work" ]; then
+        SELF_REVIEW_ISSUES=$(echo "$SELF_REVIEW_OUTPUT" | jq -r '.issues // [] | join("\n- ")' 2>/dev/null || echo "")
+        log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} self-review found issues, spawning fix agent"
+        post_status "🔄 **Self-review found gaps** — fixing before CI"
+
+        claude --permission-mode bypassPermissions --setting-sources project,local -p "You are working in an isolated git worktree for the ${REPO_NAME} project.
+Read CLAUDE.md for project conventions.
+
+## Self-Review Found Issues — Fix Before CI
+
+A review of your implementation for ${IDENTIFIER}: ${TITLE} found these gaps:
+
+- ${SELF_REVIEW_ISSUES}
+
+Fix ALL issues above. Make new, atomic commits for each fix.
+Do NOT push or open a PR.
+
+$([ "$ISSUE_TYPE" = "bug" ] && [ ! -f ".claude/rca/${IDENTIFIER}.md" ] && echo "CRITICAL: This is a bug fix but no RCA document was created. Use the rca skill to create .claude/rca/${IDENTIFIER}.md BEFORE proceeding.")
+$([ ! -f ".claude/verify/${IDENTIFIER}.md" ] && echo "IMPORTANT: No verification report found. Use the verify skill to create .claude/verify/${IDENTIFIER}.md.")
+$([ ! -f ".claude/agent-reports/${IDENTIFIER}.md" ] && echo "IMPORTANT: No agent report found. Use the agent-report skill to create .claude/agent-reports/${IDENTIFIER}.md.")" --max-turns 200 >> "$ISSUE_LOG" 2>&1
+      fi
+
       # --- Deterministic CI gate with retry loop ---
       CI_PASSED=false
 
@@ -1318,6 +1548,7 @@ Check the agent log for details: \`$ISSUE_LOG\`" >/dev/null 2>&1
           CI_OUTPUT_FILE="$LOG_DIR/${WORKSPACE}-${IDENTIFIER}-ci-${ATTEMPT}.log"
           if "$CI_GATE" "$WORKTREE" > "$CI_OUTPUT_FILE" 2>&1; then
             CI_PASSED=true
+            git tag -f "checkpoint/${IDENTIFIER}/ci-passed" HEAD 2>/dev/null
             log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} CI gate passed (attempt ${ATTEMPT})"
             break
           fi
@@ -1329,14 +1560,44 @@ Check the agent log for details: \`$ISSUE_LOG\`" >/dev/null 2>&1
             CI_ERRORS=$(cat "$CI_OUTPUT_FILE")
             post_status "🔄 **CI gate failed (attempt ${ATTEMPT})** — spawning Claude to fix errors"
 
+            # Categorize CI errors for smarter fixing
+            CI_HAS_TYPE_ERRORS=false
+            CI_HAS_TEST_FAILURES=false
+            CI_HAS_LINT_ERRORS=false
+            CI_HAS_BUILD_ERRORS=false
+            echo "$CI_ERRORS" | grep -qiE 'TS[0-9]+|type.*error|cannot find.*type|not assignable' && CI_HAS_TYPE_ERRORS=true
+            echo "$CI_ERRORS" | grep -qiE 'FAIL|AssertionError|expect.*toBe|test.*failed' && CI_HAS_TEST_FAILURES=true
+            echo "$CI_ERRORS" | grep -qiE 'eslint|lint|warning.*rule|prettier' && CI_HAS_LINT_ERRORS=true
+            echo "$CI_ERRORS" | grep -qiE 'build.*fail|module not found|cannot resolve|compilation' && CI_HAS_BUILD_ERRORS=true
+
+            CI_DIAGNOSIS="Error categories detected:"
+            $CI_HAS_TYPE_ERRORS && CI_DIAGNOSIS="$CI_DIAGNOSIS\n- TYPE ERRORS: Fix type mismatches, missing types, incorrect generics"
+            $CI_HAS_TEST_FAILURES && CI_DIAGNOSIS="$CI_DIAGNOSIS\n- TEST FAILURES: Check if your implementation is correct — do NOT modify test assertions unless the old behavior was intentionally changed"
+            $CI_HAS_LINT_ERRORS && CI_DIAGNOSIS="$CI_DIAGNOSIS\n- LINT ERRORS: Fix formatting, unused imports, rule violations"
+            $CI_HAS_BUILD_ERRORS && CI_DIAGNOSIS="$CI_DIAGNOSIS\n- BUILD ERRORS: Fix missing modules, import resolution, config issues"
+
             claude --permission-mode bypassPermissions --setting-sources project,local -p "You are working in an isolated git worktree for the ${REPO_NAME} project.
 Read CLAUDE.md for all project conventions.
 
-## CI Gate Failed — Fix These Errors
+## CI Gate Failed (attempt ${ATTEMPT}/${MAX_CI_RETRIES}) — Fix These Errors
 
-The CI gate (type-check, tests, build) failed after your implementation of ${IDENTIFIER}: ${TITLE}.
+The CI gate failed after implementation of ${IDENTIFIER}: ${TITLE}.
 
-Fix ALL failures below, even if they are unrelated to your changes. The CI gate must pass before we can push.
+### What was being implemented
+${DESCRIPTION}
+
+### ${CI_DIAGNOSIS}
+
+### Fix order (earlier fixes often resolve later errors):
+1. Import/module resolution
+2. Type errors
+3. Lint errors
+4. Test failures (fix implementation, NOT test assertions)
+5. Build errors
+
+## CRITICAL: Do NOT delete or gut features to make CI pass.
+The implementation must STILL address the issue requirements after your fixes.
+If a test is failing because the implementation is wrong, fix the implementation.
 
 ## CI Gate Output:
 \`\`\`
@@ -1348,7 +1609,7 @@ ${CI_ERRORS}
 - Run the failing commands yourself to verify fixes before committing
 - Commit fixes with a message like 'fix: resolve CI failures for ${IDENTIFIER}'
 - Do NOT push or open a PR
-- Do NOT modify files outside this worktree" --max-turns 500 >> "$ISSUE_LOG" 2>&1
+- Do NOT delete feature code to make CI pass" --max-turns 300 >> "$ISSUE_LOG" 2>&1
           else
             log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} CI gate FAILED after ${MAX_CI_RETRIES} attempts — not pushed"
 
@@ -1428,9 +1689,9 @@ Ready for re-review." >/dev/null 2>&1
             # Auto-review existing PR if enabled
             if [ "$AUTO_REVIEW" = true ]; then
               local REVIEW_VERDICT
-              REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER")
+              REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$TITLE" "$DESCRIPTION")
               if [ "$AUTO_FIX" = true ] && [ "$REVIEW_VERDICT" = "request_changes" ]; then
-                auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME"
+                auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME" "$TITLE" "$DESCRIPTION"
               fi
             fi
           else
@@ -1468,9 +1729,9 @@ Ready for human review." >/dev/null 2>&1
               # Auto-review new PR if enabled
               if [ "$AUTO_REVIEW" = true ]; then
                 local REVIEW_VERDICT
-                REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER")
+                REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$TITLE" "$DESCRIPTION")
                 if [ "$AUTO_FIX" = true ] && [ "$REVIEW_VERDICT" = "request_changes" ]; then
-                  auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME"
+                  auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME" "$TITLE" "$DESCRIPTION"
                 fi
               fi
             else
@@ -1504,9 +1765,9 @@ Ready for human review." >/dev/null 2>&1
         # Auto-review even without ci-gate
         if [ "$AUTO_REVIEW" = true ]; then
           local REVIEW_VERDICT
-          REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER")
+          REVIEW_VERDICT=$(auto_review_pr "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$TITLE" "$DESCRIPTION")
           if [ "$AUTO_FIX" = true ] && [ "$REVIEW_VERDICT" = "request_changes" ]; then
-            auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME"
+            auto_fix_loop "$WORKTREE" "$REPO_DIR" "$BRANCH" "$IDENTIFIER" "$REPO_NAME" "$TITLE" "$DESCRIPTION"
           fi
         fi
       fi

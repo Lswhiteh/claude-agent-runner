@@ -21,8 +21,12 @@ skills/                     Claude Code skills for agent use
   debug/                    Debugging guidance
   frontend/                 Frontend implementation guidance
   implement/                Feature implementation workflow
+  learnings/                Cross-run knowledge base accumulation
+  preflight/                Pre-implementation issue triage
+  rca/                      Root cause analysis for bug fixes
   review-pr/                PR review guidance
   simplify/                 Code simplification
+  verify/                   Post-implementation requirement verification
 
 config/
   config.example.json       Config template with all fields documented
@@ -32,11 +36,15 @@ setup.sh                    One-command install: symlinks, hooks, skills, config
 
 ## Key Architecture
 
-### Agent Runner (~1200 lines bash)
+### Agent Runner (~1800 lines bash)
+- **Pre-flight triage**: Classifies issues (bug/feature/refactor/chore) and checks requirement sufficiency before committing to full implementation. Blocks under-specified issues early.
+- **Bug-aware prompting**: Bug fixes get RCA-first workflow instructions; features get standard TDD workflow. The agent's prompt is tailored to the issue type.
 - **Polling**: Fetches Linear issues labeled with configurable label (default: "Agent")
 - **Worktrees**: Creates isolated worktrees at `~/.claude/worktrees/<repo>/issue-<ID>/`
 - **Branches**: Named `agent/<IDENTIFIER>` (e.g., `agent/ENG-123`)
 - **DB isolation**: Docker containers with random ephemeral ports (postgres or supabase mode)
+- **Cross-run learnings**: Reads `.claude/learnings.md` at session start so agents benefit from past discoveries
+- **Self-review gate**: After implementation, a read-only review checks for completeness gaps (missing tests, missing RCA doc, missing verification) before running CI
 - **CI gate**: Runs ci-gate before pushing, retries with Claude fix attempts
 - **PR workflow**: Creates PRs, posts implementation reports to Linear
 - **Feedback resume**: Re-label to resume with PR/Linear feedback
@@ -65,6 +73,13 @@ setup.sh                    One-command install: symlinks, hooks, skills, config
 - Logs at `~/.config/claude-agents/logs/<workspace>-<identifier>.log`
 - Locks at `~/.config/claude-agents/locks/<repo>.lock`
 - Worktrees at `~/.claude/worktrees/<repo>/issue-<ID>/` (outside repos to avoid bundler conflicts)
+
+### Agent Artifacts (per-issue, committed to repo)
+- `.claude/agent-reports/<ID>.md` — Implementation report (mandatory)
+- `.claude/rca/<ID>.md` — Root cause analysis (mandatory for bug fixes)
+- `.claude/verify/<ID>.md` — Verification report (mandatory)
+- `.claude/agent-blocked/<ID>.md` — Blocked questions (triggers pause)
+- `.claude/learnings.md` — Cross-run knowledge base (append-only, persistent)
 
 ## Editing Guidelines
 

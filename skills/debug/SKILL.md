@@ -1,12 +1,18 @@
 ---
 name: debug
-description: Systematic debugging workflow. Reproduces the issue, isolates the root cause, fixes it, and adds a regression test. Use when something is broken and the cause isn't obvious.
+description: Tactical debugging toolkit for isolating failures during implementation. Use for live debugging when you hit unexpected errors mid-task. For structured bug-fix issues from Linear, use the `rca` skill instead — it enforces a documented root cause analysis workflow.
 user_invocable: true
 ---
 
 # debug
 
-Systematic approach to finding and fixing bugs. Do not guess — follow the evidence.
+Tactical debugging toolkit for when you hit unexpected failures during implementation.
+
+**When to use `debug` vs `rca`:**
+- **`rca`**: You're working a bug-fix issue from Linear. Use rca for the full structured workflow (reproduce → root cause → document → fix → verify). RCA produces a mandatory `.claude/rca/<ID>.md` document.
+- **`debug`**: You're implementing a feature and something unexpected breaks. Use debug to figure out what went wrong, then keep implementing.
+
+Do not guess — follow the evidence.
 
 ## Step 1: Reproduce
 
