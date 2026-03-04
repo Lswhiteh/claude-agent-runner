@@ -1641,18 +1641,30 @@ run_agents_for_team() {
 
   cleanup_worktrees "$REPO_DIR"
 
-  # Count active slots
+  # Count active slots by running agent processes (not just worktree dirs)
+  # A worktree sitting idle (PR open, waiting for review) doesn't count
   local ACTIVE=0
   local WT_BASE="$HOME/.claude/worktrees/${REPO_NAME}"
   if [ -d "$WT_BASE" ]; then
     for wt in "$WT_BASE"/issue-*; do
-      [ -d "$wt" ] && ACTIVE=$((ACTIVE + 1))
+      [ -d "$wt" ] || continue
+      local PID_FILE="$wt/.claude/agent.pid"
+      if [ -f "$PID_FILE" ]; then
+        local AGENT_PID
+        AGENT_PID=$(cat "$PID_FILE")
+        if kill -0 "$AGENT_PID" 2>/dev/null; then
+          ACTIVE=$((ACTIVE + 1))
+        else
+          # Stale PID file — agent finished
+          rm -f "$PID_FILE"
+        fi
+      fi
     done
   fi
 
   local SLOTS=$((MAX_PARALLEL - ACTIVE))
   if [ "$SLOTS" -le 0 ]; then
-    log "[$WORKSPACE/$TEAM_NAME] All $MAX_PARALLEL slots in use"
+    log "[$WORKSPACE/$TEAM_NAME] All $MAX_PARALLEL slots in use ($ACTIVE agents running)"
     rm -f "$LOCK_FILE"
     return 0
   fi
@@ -2183,6 +2195,8 @@ Ready for human review." >/dev/null 2>&1
       stop_agent_db "$IDENTIFIER"
 
     ) >> "$ISSUE_LOG" 2>&1 &
+    mkdir -p "$WORKTREE/.claude"
+    echo $! > "$WORKTREE/.claude/agent.pid"
 
     log "[$WORKSPACE/$TEAM_NAME] Spawned agent for ${IDENTIFIER} (log: $ISSUE_LOG)"
   done
