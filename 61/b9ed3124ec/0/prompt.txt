@@ -1,0 +1,130 @@
+Implement the following plan:
+
+# Plan: JSONL Event Tracing + Viewer UI for claude-agent-runner
+
+## Context
+
+The agent runner has text logs, Linear comments, and Slack notifications — but no structured event timeline. For orchestrated (multi-agent) runs especially, it's hard to trace what happened, when, and why. This adds structured JSONL event tracing at every decision point, a CLI tool for querying traces, and a single-file HTML viewer with timeline visualization and orchestration swimlanes.
+
+## JSONL Event Schema
+
+One file per issue: `~/.config/claude-agents/traces/<workspace>-<identifier>.jsonl`
+Multiple runs of the same issue (resume after blocked/feedback) append to the same file, distinguished by `run_id`.
+
+Each line:
+```json
+{"ts":"2026-03-04T14:22:01Z","event":"ci.passed","run_id":"ENG-123-1709560921","identifier":"ENG-123","workspace":"myws","data":{"attempt":"2"}}
+```
+
+**~30 events across 7 categories:**
+
+| Category | Events |
+|---|---|
+| Issue lifecycle | `issue.picked_up`, `issue.resumed`, `worktree.created`, `worktree.reused` |
+| Agent execution | `agent.started` (mode: standard/scoped-worker/orchestrator/fix/ci-fix), `agent.finished`, `agent.blocked`, `agent.no_changes` |
+| Orchestration | `orchestrator.decomposed`, `orchestrator.fallback`, `subtask.created`, `subtask.completed`, `subtask.scope_overflow`, `integration.started/passed/failed` |
+| CI | `ci.started`, `ci.passed`, `ci.failed`, `ci_fix.started`, `ci_fix.finished` |
+| PR | `pr.created`, `pr.pushed`, `pr.creation_failed` |
+| Review/Fix | `review.started`, `review.completed`, `fix.started`, `fix.completed`, `fix.ci_failed` |
+| Cleanup | `db.started`, `db.stopped`, `worktree.cleaned` |
+
+## New Files (3)
+
+### 1. Trace functions in `bin/claude-agent-runner` (~line 65, after `log()`)
+
+`init_trace()` — sets `TRACE_RUN_ID`, `TRACE_FILE`, exports into subshell env
+`trace_event()` — pure printf+bash string ops, no jq, no subshells beyond `date`. Appends one JSONL line. No-op if `TRACE_FILE` unset.
+
+~30 `trace_event` call sites added at every decision point (see insertion points below).
+
+### 2. `bin/agent-trace` — CLI tool
+
+```
+agent-trace list                    List all trace files with event counts and time range
+agent-trace show <identifier>       Pretty-print events (jq colored)
+agent-trace tail <identifier>       Live-tail events as they're emitted
+agent-trace view [identifier]       Start HTTP viewer in browser
+```
+
+`view` copies `agent-trace-viewer.html` into the traces dir as `index.html`, starts `python3 -m http.server 7842 --bind 127.0.0.1`, opens browser. Ctrl-C to stop.
+
+### 3. `bin/agent-trace-viewer.html` — Single-file HTML viewer
+
+No build step, no CDN, no framework. All CSS/JS inline.
+
+**Layout:**
+- Dark sidebar listing all trace files (identifier, event count, relative time)
+- Main area with vertical timeline of color-coded events
+- Toolbar with search/filter input and auto-refresh toggle (5s polling)
+
+**Event rendering:**
+- Color-coded left border: green (passed/created), red (failed/blocked), blue (info), orange (CI), purple (orchestration)
+- Click to expand: shows raw `data` as formatted JSON
+- Timestamps as HH:MM:SS with full ISO on hover
+
+**Orchestration swimlanes:**
+- Auto-detected when `subtask.*` events are present
+- One vertical lane for orchestrator, one per subtask identifier
+- Events placed in the matching lane
+
+**Data fetching:**
+- Parses `python3 http.server` directory listing HTML for `.jsonl` file links
+- Fetches each file, parses line-by-line as JSON
+- Auto-refresh re-fetches selected file every 5s while toggle is on
+
+## Modified Files (2)
+
+### `bin/claude-agent-runner` — Add trace infrastructure + ~30 call sites
+
+**Trace function insertion:** After `log()` definition (~line 65)
+
+**Key insertion points for `trace_event` calls:**
+
+| Location | Event(s) |
+|---|---|
+| After WORKTREE/BRANCH set in main loop (~1721) | `init_trace`, `issue.picked_up` |
+| Worktree creation/reuse (~1730-1743) | `worktree.created/reused` |
+| Resume paths (~1812, 1831) | `issue.resumed` |
+| Before each `claude` invocation | `agent.started` with mode |
+| After each `claude` returns | `agent.finished` |
+| Blocked check (~1985) | `agent.blocked` |
+| No-commits check (~2000) | `agent.no_changes` |
+| CI gate loop (~2019-2040) | `ci.started/passed/failed`, `ci_fix.started/finished` |
+| PR creation (~2148-2177) | `pr.created/pushed/creation_failed` |
+| `orchestrate_issue()` (~935-1060) | `orchestrator.decomposed/fallback`, `subtask.created` |
+| Supervisor loop (~1137-1143) | `subtask.completed/scope_overflow` |
+| Integration CI (~1191-1223) | `integration.started/passed/failed` |
+| `auto_review_pr()` (~691-723) | `review.started/completed` |
+| `auto_fix_loop()` (~765-828) | `fix.started/completed/ci_failed` |
+| `start_agent_db()` (~426) | `db.started` |
+| DB stop, worktree cleanup | `db.stopped`, `worktree.cleaned` |
+
+### `setup.sh` — Add traces directory
+
+Add `mkdir -p "$HOME/.config/claude-agents/traces"` in the config section.
+`agent-trace` is auto-symlinked by the existing `for script in "$REPO_DIR/bin/"*` loop.
+
+## Implementation Order
+
+1. `bin/agent-trace-viewer.html` — testable standalone with sample JSONL
+2. `bin/agent-trace` — CLI tool
+3. Trace functions in `bin/claude-agent-runner` (init_trace, trace_event)
+4. ~30 trace_event call sites throughout `bin/claude-agent-runner`
+5. `setup.sh` update + `CLAUDE.md` update
+
+## Verification
+
+1. Create sample `.jsonl` with mixed events → `agent-trace view` → verify timeline renders
+2. Create sample with `subtask.*` events → verify swimlane view activates
+3. `agent-trace list` → verify formatting
+4. `agent-trace show <id>` → verify jq pretty-print
+5. `agent-trace tail <id>` with live appends → verify streaming
+6. `bash -n` syntax check on all new/modified files
+7. Run `setup.sh` twice → verify idempotent
+
+
+If you need specific details from before exiting plan mode (like exact code snippets, error messages, or content you generated), read the full transcript at: /Users/lswhiteh/.claude/projects/-Users-lswhiteh-Work-claude-agent-runner/89576743-fb86-4ccd-9ef1-fe3568ecfa77.jsonl
+
+---
+
+push
