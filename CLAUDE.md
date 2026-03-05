@@ -8,6 +8,8 @@ Autonomous Claude agent orchestrator that polls Linear for labeled issues, spawn
 bin/
   claude-agent-runner       Main orchestrator script
   ci-gate                   Deterministic CI checks before push
+  agent-trace               CLI for querying JSONL event traces (list, show, tail, view)
+  agent-trace-viewer.html   Single-file HTML viewer for trace timelines
 
 hooks/
   block-destructive.sh      PreToolUse:Bash — blocks rm -rf, force-push, etc. (CLAUDE_AGENT_MODE=1)
@@ -45,7 +47,7 @@ setup.sh                    One-command install: symlinks, hooks, skills, config
 
 ## Key Architecture
 
-### Agent Runner (~2350 lines bash)
+### Agent Runner (~2450 lines bash)
 - **Polling**: Fetches Linear issues labeled with configurable label (default: "Agent")
 - **Worktrees**: Creates isolated worktrees at `~/.claude/worktrees/<repo>/issue-<ID>/`
 - **Branches**: Named `agent/<IDENTIFIER>` (e.g., `agent/ENG-123`)
@@ -63,6 +65,7 @@ setup.sh                    One-command install: symlinks, hooks, skills, config
 - **Scoped workers**: Sub-issues of orchestrated parents run with file scope enforcement via scope-guard hook
 - **Guardrails**: Exports CLAUDE_AGENT_MODE=1 for block-destructive.sh; CLAUDE_AGENT_SCOPED=1 for scope-guard.sh
 - **Agent identity**: Exports CLAUDE_AGENT_ISSUE_ID, CLAUDE_AGENT_REPO, CLAUDE_AGENT_BRANCH, CLAUDE_AGENT_WORKTREE at all claude invocation sites
+- **Event tracing**: JSONL event traces at `~/.config/claude-agents/traces/` — one file per issue, ~30 events across 7 categories (issue, agent, orchestration, CI, PR, review, cleanup)
 
 ### ci-gate
 - Reads `.ci-gate` file if present, otherwise auto-detects project type
@@ -127,12 +130,24 @@ setup.sh                    One-command install: symlinks, hooks, skills, config
 - Saves git state snapshot to `.claude/agent-state/compact-snapshot-<timestamp>.md`
 - Non-blocking (PreCompact cannot prevent compaction)
 
+### agent-trace
+- CLI tool for querying JSONL event traces
+- Subcommands: `list` (all traces), `show <id>` (pretty-print), `tail <id>` (live-tail), `view [id]` (browser viewer)
+- `view` copies viewer HTML into traces dir, starts `python3 -m http.server 7842`, opens browser
+
+### agent-trace-viewer.html
+- Single-file HTML viewer (no build step, no CDN, no framework)
+- Dark sidebar listing trace files; main area with color-coded vertical timeline
+- Filter chips by category, search input, auto-refresh toggle (5s polling)
+- Swimlane view auto-activates when orchestration/subtask events are present
+
 ## Conventions
 
 - All scripts use `set -uo pipefail` (not `-e` for agent runner since subshells handle errors)
 - Config lives at `~/.config/claude-agents/config.json`
 - Secrets at `~/.config/claude-agents/secrets.env` (chmod 600)
 - Logs at `~/.config/claude-agents/logs/<workspace>-<identifier>.log`
+- Traces at `~/.config/claude-agents/traces/<workspace>-<identifier>.jsonl`
 - Locks at `~/.config/claude-agents/locks/<repo>.lock`
 - Worktrees at `~/.claude/worktrees/<repo>/issue-<ID>/` (outside repos to avoid bundler conflicts)
 

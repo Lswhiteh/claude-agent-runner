@@ -64,6 +64,50 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
+# --- JSONL Event Tracing ---
+
+TRACE_DIR="$HOME/.config/claude-agents/traces"
+mkdir -p "$TRACE_DIR"
+
+# Initialize tracing for an issue run
+# Sets TRACE_RUN_ID and TRACE_FILE; exports them for subshells
+init_trace() {
+  local WORKSPACE="$1"
+  local IDENTIFIER="$2"
+  TRACE_RUN_ID="${IDENTIFIER}-$(date +%s)"
+  TRACE_FILE="${TRACE_DIR}/${WORKSPACE}-${IDENTIFIER}.jsonl"
+  export TRACE_RUN_ID TRACE_FILE
+}
+
+# Emit a single JSONL trace event
+# Usage: trace_event <event_name> [key=value ...]
+# No-op if TRACE_FILE is unset. Pure printf, no jq, no subshells beyond date.
+trace_event() {
+  [ -z "${TRACE_FILE:-}" ] && return 0
+  local EVENT="$1"; shift
+  local TS
+  TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  local DATA="{"
+  local FIRST=true
+  while [ $# -gt 0 ]; do
+    local KEY="${1%%=*}"
+    local VAL="${1#*=}"
+    # Escape quotes in value
+    VAL=$(printf '%s' "$VAL" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    if [ "$FIRST" = true ]; then
+      DATA="${DATA}\"${KEY}\":\"${VAL}\""
+      FIRST=false
+    else
+      DATA="${DATA},\"${KEY}\":\"${VAL}\""
+    fi
+    shift
+  done
+  DATA="${DATA}}"
+  printf '{"ts":"%s","event":"%s","run_id":"%s","identifier":"%s","workspace":"%s","data":%s}\n' \
+    "$TS" "$EVENT" "${TRACE_RUN_ID:-}" "${TRACE_IDENTIFIER:-}" "${TRACE_WORKSPACE:-}" "$DATA" \
+    >> "$TRACE_FILE"
+}
+
 # --- Resolve ci-gate path ---
 
 resolve_ci_gate() {
@@ -424,6 +468,7 @@ start_agent_db() {
 
   _write_db_env "$WORKTREE" "$DB_PORT" "$DB_TYPE"
   log "[$REPO_NAME] DB running for ${IDENTIFIER} on port ${DB_PORT}"
+  trace_event "db.started" "type=$DB_TYPE" "port=$DB_PORT"
   return 0
 }
 
@@ -457,6 +502,7 @@ stop_agent_db() {
   local IDENTIFIER="$1"
   local CONTAINER="agent-db-${IDENTIFIER}"
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  trace_event "db.stopped"
 }
 
 cleanup_agent_dbs() {
@@ -576,6 +622,7 @@ cleanup_worktrees() {
         git worktree remove "$wt" --force 2>/dev/null || true
         git branch -D "agent/${ISSUE_ID}" 2>/dev/null || true
         CLEANED=$((CLEANED + 1))
+        # Note: trace_event is no-op here since TRACE_FILE is not set in cleanup context
       fi
     done
   fi
@@ -641,6 +688,7 @@ auto_review_pr() {
   [ -z "$PR_NUMBER" ] && return 1
 
   log "[review] Reviewing PR #${PR_NUMBER} for ${IDENTIFIER}"
+  trace_event "review.started" "pr_number=$PR_NUMBER"
 
   # Get the full diff
   local DIFF
@@ -745,6 +793,7 @@ _Automated review by claude-agent-runner_" 2>/dev/null
     log "[review] PR #${PR_NUMBER} commented (non-JSON output)"
   fi
 
+  trace_event "review.completed" "verdict=$VERDICT" "pr_number=$PR_NUMBER"
   echo "$VERDICT"
 }
 
@@ -764,6 +813,7 @@ auto_fix_loop() {
 
   for ITER in $(seq 1 "$MAX_REVIEW_FIX_ITERATIONS"); do
     log "[auto-fix] Iteration ${ITER}/${MAX_REVIEW_FIX_ITERATIONS} for ${IDENTIFIER}"
+    trace_event "fix.started" "iteration=$ITER"
 
     # Check latest review verdict
     local LATEST_REVIEW_STATE
@@ -826,6 +876,7 @@ Make new commits. Do NOT push." --max-turns 200 >> "$LOG_DIR/${IDENTIFIER}-fix-c
 
         if ! "$CI_GATE" "$WORKTREE" >/dev/null 2>&1; then
           log "[auto-fix] CI still failing after retry, bailing out of fix loop"
+          trace_event "fix.ci_failed" "iteration=$ITER"
           return 1
         fi
       fi
@@ -841,6 +892,7 @@ Make new commits. Do NOT push." --max-turns 200 >> "$LOG_DIR/${IDENTIFIER}-fix-c
 
     if [ "$NEW_VERDICT" = "approve" ]; then
       log "[auto-fix] PR approved after fix iteration ${ITER}"
+      trace_event "fix.completed" "iteration=$ITER" "verdict=approve"
       return 0
     fi
 
@@ -933,6 +985,7 @@ Explore the codebase thoroughly before decomposing. Every file path in your scop
   # Check for no-decomposition result
   if [ -f "$ORCH_DIR/no_decomposition.json" ]; then
     log "[orchestrator] ${IDENTIFIER} — no decomposition needed"
+    trace_event "orchestrator.fallback" "reason=no_decomposition"
     linear_comment "$API_KEY" "$ISSUE_ID" "🧩 Orchestrator decided no decomposition needed — falling back to single agent" >/dev/null 2>&1
     return 1  # Signal caller to fall back to single-agent
   fi
@@ -952,11 +1005,13 @@ Explore the codebase thoroughly before decomposing. Every file path in your scop
 
   if [ "$SUBTASK_COUNT" -le 1 ]; then
     log "[orchestrator] ${IDENTIFIER} — ${SUBTASK_COUNT} subtasks (need 2+), falling back to single agent"
+    trace_event "orchestrator.fallback" "reason=too_few_subtasks" "count=$SUBTASK_COUNT"
     linear_comment "$API_KEY" "$ISSUE_ID" "🧩 Orchestrator produced ${SUBTASK_COUNT} subtask(s) — falling back to single agent" >/dev/null 2>&1
     return 1
   fi
 
   log "[orchestrator] ${IDENTIFIER} decomposed into ${SUBTASK_COUNT} subtasks"
+  trace_event "orchestrator.decomposed" "count=$SUBTASK_COUNT"
 
   # Get agent label ID
   local AGENT_LABEL_ID
@@ -1013,6 +1068,7 @@ ${ST_DEPS:-None}
 
     if [ -n "$SUB_ISSUE_ID" ]; then
       log "[orchestrator] Created subtask: ${SUB_IDENTIFIER} — ${ST_TITLE}"
+      trace_event "subtask.created" "subtask_id=$ST_ID" "identifier=$SUB_IDENTIFIER" "title=$ST_TITLE"
 
       # Track in state
       STATE_SUBTASKS=$(echo "$STATE_SUBTASKS" | jq \
@@ -1135,6 +1191,7 @@ Workers will pick up subtasks as they become unblocked. The orchestrator will va
       case "$LINEAR_STATE" in
         completed)
           log "[orchestrator] Subtask ${ST_ID} completed — validating"
+          trace_event "subtask.completed" "subtask_id=$ST_ID"
           UPDATED_SUBTASKS=$(echo "$UPDATED_SUBTASKS" | jq --arg id "$ST_ID" \
             '[.[] | if .id == $id then .status = "completed" else . end]')
 
@@ -1142,6 +1199,7 @@ Workers will pick up subtasks as they become unblocked. The orchestrator will va
           local OVERFLOW_FILE="$ORCH_DIR/scope-overflow-${ST_ID}.md"
           if [ -f "$OVERFLOW_FILE" ]; then
             log "[orchestrator] Subtask ${ST_ID} has scope overflow — creating follow-up"
+            trace_event "subtask.scope_overflow" "subtask_id=$ST_ID"
             local OVERFLOW_CONTENT
             OVERFLOW_CONTENT=$(cat "$OVERFLOW_FILE")
             linear_comment "$API_KEY" "$ISSUE_ID" "⚠️ Subtask ${ST_ID} reported scope overflow:
@@ -1188,12 +1246,15 @@ Creating a follow-up subtask." >/dev/null 2>&1
   CI_GATE=$(resolve_ci_gate)
 
   local INTEGRATION_PASSED=false
+  trace_event "integration.started"
   if [ -n "$CI_GATE" ] && [ -x "$CI_GATE" ]; then
     if "$CI_GATE" "$WORKTREE" >> "$LOG_DIR/${WORKSPACE}-${IDENTIFIER}-integration.log" 2>&1; then
       INTEGRATION_PASSED=true
       log "[orchestrator] Integration CI passed for ${IDENTIFIER}"
+      trace_event "integration.passed"
     else
       log "[orchestrator] Integration CI failed for ${IDENTIFIER} — spawning fix agent"
+      trace_event "integration.failed"
 
       local CI_ERRORS
       CI_ERRORS=$(cat "$LOG_DIR/${WORKSPACE}-${IDENTIFIER}-integration.log" | tail -80)
@@ -1218,8 +1279,10 @@ Do NOT push or open a PR." --max-turns 500 >> "$LOG_DIR/${WORKSPACE}-${IDENTIFIE
       if "$CI_GATE" "$WORKTREE" >> "$LOG_DIR/${WORKSPACE}-${IDENTIFIER}-integration-retry.log" 2>&1; then
         INTEGRATION_PASSED=true
         log "[orchestrator] Integration CI passed after fix for ${IDENTIFIER}"
+        trace_event "integration.passed" "after_fix=true"
       else
         log "[orchestrator] Integration CI still failing for ${IDENTIFIER}"
+        trace_event "integration.failed" "after_fix=true"
       fi
     fi
   else
@@ -1720,6 +1783,13 @@ run_agents_for_team() {
     mkdir -p "$WORKTREE_BASE"
     WORKTREE="$WORKTREE_BASE/issue-${IDENTIFIER}"
 
+    # Initialize tracing for this issue
+    init_trace "$WORKSPACE" "$IDENTIFIER"
+    TRACE_IDENTIFIER="$IDENTIFIER"
+    TRACE_WORKSPACE="$WORKSPACE"
+    export TRACE_IDENTIFIER TRACE_WORKSPACE
+    trace_event "issue.picked_up" "title=$TITLE"
+
     RESUMING=false
     RESUME_REASON=""
     if [ -d "$WORKTREE" ]; then
@@ -1734,6 +1804,7 @@ run_agents_for_team() {
         RESUME_REASON="feedback"
         log "[$WORKSPACE/$TEAM_NAME] Resuming ${IDENTIFIER} (feedback on existing PR)"
       fi
+      trace_event "worktree.reused"
     else
       git fetch origin main 2>/dev/null || true
       git worktree add "$WORKTREE" -b "$BRANCH" origin/main 2>/dev/null || {
@@ -1744,6 +1815,7 @@ run_agents_for_team() {
 
       [ -f ".env" ] && cp .env "$WORKTREE/.env"
       [ -f ".env.local" ] && cp .env.local "$WORKTREE/.env.local"
+      trace_event "worktree.created"
     fi
 
     # --- Linear: In Progress ---
@@ -1809,10 +1881,12 @@ run_agents_for_team() {
 
         if [ "$RESUME_REASON" = "blocked" ]; then
           COMMENTS=$(linear_get_comments "$API_KEY" "$ISSUE_ID")
+          trace_event "issue.resumed" "reason=blocked"
           post_status "🔄 **Agent resuming** — developer responded, continuing work"
           slack_notify "$SLACK_WEBHOOK" "🔄 [${WORKSPACE}/${TEAM_NAME}] Agent resuming ${IDENTIFIER} — developer responded to blocked question"
 
           if [ -n "$PREV_SESSION" ]; then
+            trace_event "agent.started" "mode=standard" "resume=blocked"
             claude --permission-mode bypassPermissions --setting-sources project,local -r "$PREV_SESSION" -p "The developer has responded to your question. Here are the latest comments from Linear:
 
 ${COMMENTS}
@@ -1820,6 +1894,7 @@ ${COMMENTS}
 Continue implementing ${IDENTIFIER}: ${TITLE}
 Remember: do NOT push or open a PR. Just implement, test, and commit.
 If you are still blocked, create .claude/agent-blocked/${IDENTIFIER}.md again." --max-turns 500
+            trace_event "agent.finished" "mode=standard" "resume=blocked"
           else
             RESUMING=false
           fi
@@ -1827,6 +1902,7 @@ If you are still blocked, create .claude/agent-blocked/${IDENTIFIER}.md again." 
         elif [ "$RESUME_REASON" = "feedback" ]; then
           COMMENTS=$(linear_get_comments "$API_KEY" "$ISSUE_ID")
           PR_FEEDBACK=$(gather_pr_feedback "$REPO_DIR" "$BRANCH")
+          trace_event "issue.resumed" "reason=feedback"
           post_status "🔄 **Agent resuming** — addressing reviewer feedback"
           slack_notify "$SLACK_WEBHOOK" "🔄 [${WORKSPACE}/${TEAM_NAME}] Agent resuming ${IDENTIFIER} — addressing PR/Linear feedback"
 
@@ -1855,11 +1931,13 @@ ${COMMENTS}
           FEEDBACK_PROMPT="${FEEDBACK_PROMPT}
 Address every piece of feedback above. If something is unclear, create .claude/agent-blocked/${IDENTIFIER}.md with your questions."
 
+          trace_event "agent.started" "mode=standard" "resume=feedback"
           if [ -n "$PREV_SESSION" ]; then
             claude --permission-mode bypassPermissions --setting-sources project,local -r "$PREV_SESSION" -p "$FEEDBACK_PROMPT" --max-turns 500
           else
             claude --permission-mode bypassPermissions --setting-sources project,local -p "$FEEDBACK_PROMPT" --max-turns 500
           fi
+          trace_event "agent.finished" "mode=standard" "resume=feedback"
         fi
       fi
 
@@ -1867,27 +1945,33 @@ Address every piece of feedback above. If something is unclear, create .claude/a
 
         # --- Orchestration detection ---
         if [ "$ORCH_ENABLED" = "true" ] && should_orchestrate "$issue"; then
+          trace_event "agent.started" "mode=orchestrator"
           post_status "🧩 **Orchestrator starting** — decomposing into subtasks"
           slack_notify "$SLACK_WEBHOOK" "🧩 [${WORKSPACE}/${TEAM_NAME}] Orchestrator starting for ${IDENTIFIER}: ${TITLE}"
 
           if orchestrate_issue "$WORKTREE" "$REPO_DIR" "$IDENTIFIER" "$TITLE" "$DESCRIPTION" \
                "$API_KEY" "$ISSUE_ID" "$TEAM_ID" "$WORKSPACE" "$TEAM_NAME" "$SLACK_WEBHOOK"; then
             # Orchestrator handled everything (CI, PR, Linear state)
+            trace_event "agent.finished" "mode=orchestrator"
             stop_agent_db "$IDENTIFIER"
             exit 0
           fi
           # Orchestrator returned 1 — fall through to single-agent flow
+          trace_event "agent.finished" "mode=orchestrator" "result=fallback"
           log "[orchestrator] Falling back to single-agent for ${IDENTIFIER}"
         fi
 
         # --- Scoped worker detection ---
         if is_orchestrated_subtask "$issue"; then
+          trace_event "agent.started" "mode=scoped-worker"
           post_status "🔧 **Scoped worker** — implementing subtask"
           slack_notify "$SLACK_WEBHOOK" "🔧 [${WORKSPACE}/${TEAM_NAME}] Scoped worker started ${IDENTIFIER}: ${TITLE}"
           run_scoped_worker "$WORKTREE" "$REPO_NAME" "$IDENTIFIER" "$TITLE" "$DESCRIPTION"
+          trace_event "agent.finished" "mode=scoped-worker"
         else
 
         # --- Standard single-agent flow ---
+        trace_event "agent.started" "mode=standard"
         post_status "🔧 **Agent working** — starting implementation"
         slack_notify "$SLACK_WEBHOOK" "🔧 [${WORKSPACE}/${TEAM_NAME}] Agent started ${IDENTIFIER}: ${TITLE}"
 
@@ -1963,6 +2047,7 @@ After implementation, you MUST update project documentation:
 Commit all documentation updates as part of your work.
 
 Do NOT modify files outside this worktree." --max-turns 500
+        trace_event "agent.finished" "mode=standard"
 
         fi  # end scoped-worker vs standard agent
       fi
@@ -1981,6 +2066,7 @@ Do NOT modify files outside this worktree." --max-turns 500
       BLOCKED_FILE=".claude/agent-blocked/${IDENTIFIER}.md"
       if [ -f "$BLOCKED_FILE" ]; then
         QUESTION=$(cat "$BLOCKED_FILE")
+        trace_event "agent.blocked"
         cleanup_status_comments
         linear_comment "$API_KEY" "$ISSUE_ID" "🚧 **Agent blocked — needs human input**
 
@@ -1998,6 +2084,7 @@ ${QUESTION}
       # --- Check if agent made any commits ---
       COMMIT_COUNT=$(git rev-list --count origin/main..HEAD 2>/dev/null || echo "0")
       if [ "$COMMIT_COUNT" -eq 0 ]; then
+        trace_event "agent.no_changes"
         cleanup_status_comments
         linear_comment "$API_KEY" "$ISSUE_ID" "⚠️ **Agent made no changes** — the agent ran but did not commit any code. This may indicate the feature already exists, the task is unclear, or the agent couldn't proceed.
 
@@ -2013,20 +2100,24 @@ Check the agent log for details: \`$ISSUE_LOG\`" >/dev/null 2>&1
 
       if [ -n "$CI_GATE" ] && [ -x "$CI_GATE" ]; then
         for ATTEMPT in $(seq 1 "$MAX_CI_RETRIES"); do
+          trace_event "ci.started" "attempt=$ATTEMPT"
           post_status "🔍 **CI gate running** (attempt ${ATTEMPT}/${MAX_CI_RETRIES}) — type-check, tests, build"
 
           CI_OUTPUT_FILE="$LOG_DIR/${WORKSPACE}-${IDENTIFIER}-ci-${ATTEMPT}.log"
           if "$CI_GATE" "$WORKTREE" > "$CI_OUTPUT_FILE" 2>&1; then
             CI_PASSED=true
+            trace_event "ci.passed" "attempt=$ATTEMPT"
             log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} CI gate passed (attempt ${ATTEMPT})"
             break
           fi
 
+          trace_event "ci.failed" "attempt=$ATTEMPT"
           log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} CI gate failed (attempt ${ATTEMPT}/${MAX_CI_RETRIES})"
           cat "$CI_OUTPUT_FILE" >> "$ISSUE_LOG"
 
           if [ "$ATTEMPT" -lt "$MAX_CI_RETRIES" ]; then
             CI_ERRORS=$(cat "$CI_OUTPUT_FILE")
+            trace_event "ci_fix.started" "attempt=$ATTEMPT"
             post_status "🔄 **CI gate failed (attempt ${ATTEMPT})** — spawning Claude to fix errors"
 
             claude --permission-mode bypassPermissions --setting-sources project,local -p "You are working in an isolated git worktree for the ${REPO_NAME} project.
@@ -2049,6 +2140,7 @@ ${CI_ERRORS}
 - Commit fixes with a message like 'fix: resolve CI failures for ${IDENTIFIER}'
 - Do NOT push or open a PR
 - Do NOT modify files outside this worktree" --max-turns 500 >> "$ISSUE_LOG" 2>&1
+            trace_event "ci_fix.finished" "attempt=$ATTEMPT"
           else
             log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} CI gate FAILED after ${MAX_CI_RETRIES} attempts — not pushed"
 
@@ -2114,6 +2206,7 @@ ${REPORT_CONTENT}" >/dev/null 2>&1
           fi
 
           git push -u origin "$BRANCH" 2>&1
+          trace_event "pr.pushed"
 
           EXISTING_PR=$(gh pr view "$BRANCH" --json url --jq '.url' 2>/dev/null || echo "")
 
@@ -2159,6 +2252,7 @@ Closes ${IDENTIFIER}"
               --base main 2>&1 | tail -1 | grep -oE 'https://github\.com/[^ ]+')
 
             if [ -n "$PR_URL" ]; then
+              trace_event "pr.created" "url=$PR_URL"
               linear_set_state "$API_KEY" "$ISSUE_ID" "In Review" "$TEAM_ID" >/dev/null 2>&1
               linear_comment "$API_KEY" "$ISSUE_ID" "✅ **Agent completed** — CI gate passed, PR opened: ${PR_URL}
 
@@ -2175,6 +2269,7 @@ Ready for human review." >/dev/null 2>&1
                 fi
               fi
             else
+              trace_event "pr.creation_failed"
               linear_comment "$API_KEY" "$ISSUE_ID" "⚠️ **Push succeeded but PR creation failed** — check logs: \`$ISSUE_LOG\`" >/dev/null 2>&1
               log "[$WORKSPACE/$TEAM_NAME] ${IDENTIFIER} pushed but PR creation failed"
             fi

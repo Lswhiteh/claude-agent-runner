@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent Trace Viewer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #1a1a2e; color: #e0e0e0; display: flex; height: 100vh; overflow: hidden; }
+
+/* Sidebar */
+.sidebar { width: 280px; min-width: 280px; background: #16213e; border-right: 1px solid #0f3460; display: flex; flex-direction: column; overflow: hidden; }
+.sidebar-header { padding: 16px; border-bottom: 1px solid #0f3460; }
+.sidebar-header h1 { font-size: 16px; color: #e94560; margin-bottom: 4px; }
+.sidebar-header p { font-size: 11px; color: #888; }
+.trace-list { flex: 1; overflow-y: auto; padding: 8px; }
+.trace-item { padding: 10px 12px; border-radius: 6px; cursor: pointer; margin-bottom: 4px; transition: background 0.15s; }
+.trace-item:hover { background: #1a1a3e; }
+.trace-item.active { background: #0f3460; border-left: 3px solid #e94560; }
+.trace-item .identifier { font-weight: 600; font-size: 13px; color: #fff; }
+.trace-item .meta { font-size: 11px; color: #888; margin-top: 2px; }
+.trace-item .event-count { display: inline-block; background: #0f3460; color: #53a8b6; padding: 1px 6px; border-radius: 10px; font-size: 10px; margin-left: 6px; }
+.trace-item.active .event-count { background: #1a1a2e; }
+
+/* Main area */
+.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+/* Toolbar */
+.toolbar { padding: 12px 20px; border-bottom: 1px solid #0f3460; background: #16213e; display: flex; align-items: center; gap: 12px; }
+.toolbar input[type="text"] { flex: 1; max-width: 400px; padding: 6px 12px; background: #1a1a2e; border: 1px solid #0f3460; border-radius: 4px; color: #e0e0e0; font-size: 13px; outline: none; }
+.toolbar input[type="text"]:focus { border-color: #53a8b6; }
+.toolbar label { font-size: 12px; color: #888; cursor: pointer; display: flex; align-items: center; gap: 4px; user-select: none; }
+.toolbar input[type="checkbox"] { accent-color: #e94560; }
+.filter-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.filter-chip { font-size: 11px; padding: 2px 8px; border-radius: 10px; cursor: pointer; border: 1px solid transparent; user-select: none; opacity: 0.5; transition: opacity 0.15s; }
+.filter-chip.active { opacity: 1; border-color: rgba(255,255,255,0.2); }
+.filter-chip[data-cat="issue"] { background: #1565c0; color: #bbdefb; }
+.filter-chip[data-cat="agent"] { background: #2e7d32; color: #c8e6c9; }
+.filter-chip[data-cat="orchestration"] { background: #6a1b9a; color: #e1bee7; }
+.filter-chip[data-cat="ci"] { background: #e65100; color: #ffe0b2; }
+.filter-chip[data-cat="pr"] { background: #00838f; color: #b2ebf2; }
+.filter-chip[data-cat="review"] { background: #4527a0; color: #d1c4e9; }
+.filter-chip[data-cat="cleanup"] { background: #37474f; color: #b0bec5; }
+
+/* Content */
+.content { flex: 1; overflow-y: auto; padding: 20px; }
+.empty-state { text-align: center; margin-top: 100px; color: #555; }
+.empty-state h2 { font-size: 18px; margin-bottom: 8px; color: #888; }
+
+/* Timeline */
+.timeline { max-width: 900px; margin: 0 auto; }
+.timeline-event { display: flex; gap: 16px; margin-bottom: 2px; position: relative; }
+.timeline-event .time { width: 70px; min-width: 70px; text-align: right; font-size: 12px; color: #888; padding-top: 10px; font-variant-numeric: tabular-nums; }
+.timeline-event .dot-line { display: flex; flex-direction: column; align-items: center; width: 20px; min-width: 20px; }
+.timeline-event .dot { width: 10px; height: 10px; border-radius: 50%; margin-top: 12px; flex-shrink: 0; }
+.timeline-event .line { flex: 1; width: 2px; background: #0f3460; min-height: 8px; }
+.timeline-event:last-child .line { display: none; }
+.timeline-event .card { flex: 1; background: #16213e; border-radius: 6px; padding: 10px 14px; cursor: pointer; transition: background 0.15s; border-left: 3px solid transparent; }
+.timeline-event .card:hover { background: #1a1a3e; }
+.timeline-event .card.expanded { background: #1a1a3e; }
+.timeline-event .event-name { font-size: 13px; font-weight: 600; }
+.timeline-event .event-run { font-size: 10px; color: #666; margin-left: 8px; }
+.timeline-event .event-summary { font-size: 12px; color: #999; margin-top: 2px; }
+.timeline-event .event-data { margin-top: 8px; padding: 8px; background: #1a1a2e; border-radius: 4px; font-size: 11px; white-space: pre-wrap; word-break: break-all; color: #53a8b6; display: none; }
+.timeline-event .card.expanded .event-data { display: block; }
+
+/* Color coding */
+.color-green .dot { background: #4caf50; }
+.color-green .card { border-left-color: #4caf50; }
+.color-red .dot { background: #f44336; }
+.color-red .card { border-left-color: #f44336; }
+.color-blue .dot { background: #2196f3; }
+.color-blue .card { border-left-color: #2196f3; }
+.color-orange .dot { background: #ff9800; }
+.color-orange .card { border-left-color: #ff9800; }
+.color-purple .dot { background: #9c27b0; }
+.color-purple .card { border-left-color: #9c27b0; }
+.color-gray .dot { background: #607d8b; }
+.color-gray .card { border-left-color: #607d8b; }
+
+/* Swimlanes */
+.swimlanes { max-width: 1200px; margin: 0 auto; }
+.swimlane-header { display: flex; gap: 4px; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #0f3460; }
+.swimlane-label { flex: 1; text-align: center; font-size: 12px; font-weight: 600; color: #53a8b6; padding: 4px; background: #0f3460; border-radius: 4px; }
+.swimlane-row { display: flex; gap: 4px; margin-bottom: 2px; min-height: 36px; }
+.swimlane-cell { flex: 1; min-height: 36px; }
+.swimlane-cell .swim-event { background: #16213e; border-radius: 4px; padding: 6px 10px; font-size: 11px; cursor: pointer; border-left: 3px solid transparent; transition: background 0.15s; }
+.swimlane-cell .swim-event:hover { background: #1a1a3e; }
+.swimlane-cell .swim-event .swim-time { color: #888; font-size: 10px; }
+.swimlane-cell .swim-event .swim-name { font-weight: 600; }
+.swimlane-cell .swim-event .swim-data { margin-top: 6px; padding: 6px; background: #1a1a2e; border-radius: 4px; font-size: 10px; white-space: pre-wrap; word-break: break-all; color: #53a8b6; display: none; }
+.swimlane-cell .swim-event.expanded .swim-data { display: block; }
+.swim-time-col { width: 70px; min-width: 70px; text-align: right; font-size: 11px; color: #888; padding-top: 8px; font-variant-numeric: tabular-nums; }
+
+/* View toggle */
+.view-toggle { display: flex; gap: 4px; }
+.view-toggle button { padding: 4px 10px; font-size: 12px; background: #1a1a2e; color: #888; border: 1px solid #0f3460; border-radius: 4px; cursor: pointer; }
+.view-toggle button.active { background: #0f3460; color: #e0e0e0; border-color: #53a8b6; }
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="sidebar-header">
+    <h1>Agent Traces</h1>
+    <p>JSONL Event Viewer</p>
+  </div>
+  <div class="trace-list" id="traceList"></div>
+</div>
+
+<div class="main">
+  <div class="toolbar">
+    <input type="text" id="searchInput" placeholder="Search events...">
+    <div class="filter-chips" id="filterChips">
+      <span class="filter-chip active" data-cat="issue" onclick="toggleFilter(this)">issue</span>
+      <span class="filter-chip active" data-cat="agent" onclick="toggleFilter(this)">agent</span>
+      <span class="filter-chip active" data-cat="orchestration" onclick="toggleFilter(this)">orch</span>
+      <span class="filter-chip active" data-cat="ci" onclick="toggleFilter(this)">ci</span>
+      <span class="filter-chip active" data-cat="pr" onclick="toggleFilter(this)">pr</span>
+      <span class="filter-chip active" data-cat="review" onclick="toggleFilter(this)">review</span>
+      <span class="filter-chip active" data-cat="cleanup" onclick="toggleFilter(this)">cleanup</span>
+    </div>
+    <div class="view-toggle" id="viewToggle" style="display:none;">
+      <button class="active" onclick="setView('timeline',this)">Timeline</button>
+      <button onclick="setView('swimlane',this)">Swimlanes</button>
+    </div>
+    <label><input type="checkbox" id="autoRefresh"> Auto-refresh</label>
+  </div>
+  <div class="content" id="content">
+    <div class="empty-state">
+      <h2>Select a trace file</h2>
+      <p>Choose a trace from the sidebar to view its events</p>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  let traces = {};       // filename -> array of parsed events
+  let selectedFile = null;
+  let currentView = 'timeline';
+  let refreshTimer = null;
+  let activeFilters = new Set(['issue','agent','orchestration','ci','pr','review','cleanup']);
+
+  // Event category mapping
+  const EVENT_CATEGORIES = {
+    'issue.picked_up': 'issue', 'issue.resumed': 'issue',
+    'worktree.created': 'issue', 'worktree.reused': 'issue',
+    'agent.started': 'agent', 'agent.finished': 'agent',
+    'agent.blocked': 'agent', 'agent.no_changes': 'agent',
+    'orchestrator.decomposed': 'orchestration', 'orchestrator.fallback': 'orchestration',
+    'subtask.created': 'orchestration', 'subtask.completed': 'orchestration',
+    'subtask.scope_overflow': 'orchestration',
+    'integration.started': 'orchestration', 'integration.passed': 'orchestration', 'integration.failed': 'orchestration',
+    'ci.started': 'ci', 'ci.passed': 'ci', 'ci.failed': 'ci',
+    'ci_fix.started': 'ci', 'ci_fix.finished': 'ci',
+    'pr.created': 'pr', 'pr.pushed': 'pr', 'pr.creation_failed': 'pr',
+    'review.started': 'review', 'review.completed': 'review',
+    'fix.started': 'review', 'fix.completed': 'review', 'fix.ci_failed': 'review',
+    'db.started': 'cleanup', 'db.stopped': 'cleanup', 'worktree.cleaned': 'cleanup'
+  };
+
+  // Event color mapping
+  const EVENT_COLORS = {
+    'issue.picked_up': 'blue', 'issue.resumed': 'blue',
+    'worktree.created': 'green', 'worktree.reused': 'blue',
+    'agent.started': 'blue', 'agent.finished': 'green',
+    'agent.blocked': 'red', 'agent.no_changes': 'orange',
+    'orchestrator.decomposed': 'purple', 'orchestrator.fallback': 'orange',
+    'subtask.created': 'purple', 'subtask.completed': 'green',
+    'subtask.scope_overflow': 'orange',
+    'integration.started': 'purple', 'integration.passed': 'green', 'integration.failed': 'red',
+    'ci.started': 'orange', 'ci.passed': 'green', 'ci.failed': 'red',
+    'ci_fix.started': 'orange', 'ci_fix.finished': 'blue',
+    'pr.created': 'green', 'pr.pushed': 'green', 'pr.creation_failed': 'red',
+    'review.started': 'blue', 'review.completed': 'green',
+    'fix.started': 'blue', 'fix.completed': 'green', 'fix.ci_failed': 'red',
+    'db.started': 'gray', 'db.stopped': 'gray', 'worktree.cleaned': 'gray'
+  };
+
+  // Fetch directory listing and find .jsonl files
+  async function fetchTraceFiles() {
+    try {
+      const resp = await fetch('./');
+      const html = await resp.text();
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, 'text/html');
+      const links = doc.querySelectorAll('a');
+      const files = [];
+      links.forEach(a => {
+        const href = a.getAttribute('href');
+        if (href && href.endsWith('.jsonl')) {
+          files.push(href);
+        }
+      });
+      return files;
+    } catch (e) {
+      console.error('Failed to fetch trace files:', e);
+      return [];
+    }
+  }
+
+  // Parse a JSONL file
+  async function fetchAndParseTrace(filename) {
+    try {
+      const resp = await fetch('./' + filename);
+      const text = await resp.text();
+      const events = [];
+      text.split('\n').forEach(line => {
+        line = line.trim();
+        if (!line) return;
+        try {
+          events.push(JSON.parse(line));
+        } catch (e) { /* skip malformed lines */ }
+      });
+      return events;
+    } catch (e) {
+      console.error('Failed to fetch trace:', filename, e);
+      return [];
+    }
+  }
+
+  // Format time from ISO string
+  function formatTime(ts) {
+    if (!ts) return '--:--:--';
+    const d = new Date(ts);
+    return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
+  // Relative time
+  function relativeTime(ts) {
+    if (!ts) return '';
+    const diff = Date.now() - new Date(ts).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return mins + 'm ago';
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return hours + 'h ago';
+    const days = Math.floor(hours / 24);
+    return days + 'd ago';
+  }
+
+  // Extract identifier from filename (strip workspace prefix and .jsonl)
+  function identifierFromFile(filename) {
+    return filename.replace(/\.jsonl$/, '');
+  }
+
+  // Check if events contain subtask events (for swimlane view)
+  function hasSubtaskEvents(events) {
+    return events.some(e => e.event && (e.event.startsWith('subtask.') || e.event.startsWith('orchestrator.') || e.event.startsWith('integration.')));
+  }
+
+  // Get summary text for an event
+  function eventSummary(ev) {
+    const d = ev.data || {};
+    switch (ev.event) {
+      case 'agent.started': return d.mode ? 'mode: ' + d.mode : '';
+      case 'ci.failed': return d.attempt ? 'attempt ' + d.attempt : '';
+      case 'ci.passed': return d.attempt ? 'attempt ' + d.attempt : '';
+      case 'ci.started': return d.attempt ? 'attempt ' + d.attempt : '';
+      case 'subtask.created': return d.subtask_id || d.title || '';
+      case 'subtask.completed': return d.subtask_id || '';
+      case 'pr.created': return d.url ? d.url.split('/').pop() : '';
+      case 'review.completed': return d.verdict || '';
+      case 'fix.ci_failed': return d.iteration ? 'iter ' + d.iteration : '';
+      case 'orchestrator.decomposed': return d.count ? d.count + ' subtasks' : '';
+      default: return Object.keys(d).length ? Object.values(d).join(', ').substring(0, 60) : '';
+    }
+  }
+
+  // Determine swimlane for an event
+  function swimlaneFor(ev) {
+    const d = ev.data || {};
+    if (ev.event.startsWith('subtask.') && d.subtask_id) return d.subtask_id;
+    if (ev.event.startsWith('subtask.') && d.identifier) return d.identifier;
+    return '_orchestrator';
+  }
+
+  // Render sidebar
+  function renderSidebar() {
+    const list = document.getElementById('traceList');
+    const files = Object.keys(traces).sort();
+    list.innerHTML = files.map(f => {
+      const events = traces[f];
+      const lastTs = events.length > 0 ? events[events.length - 1].ts : null;
+      const id = identifierFromFile(f);
+      const isActive = f === selectedFile;
+      return '<div class="trace-item' + (isActive ? ' active' : '') + '" onclick="window._selectTrace(\'' + f + '\')">' +
+        '<span class="identifier">' + escapeHtml(id) + '</span>' +
+        '<span class="event-count">' + events.length + '</span>' +
+        '<div class="meta">' + relativeTime(lastTs) + '</div>' +
+        '</div>';
+    }).join('');
+    if (files.length === 0) {
+      list.innerHTML = '<div style="padding:20px;color:#555;text-align:center;">No trace files found</div>';
+    }
+  }
+
+  // Render timeline view
+  function renderTimeline(events) {
+    const search = document.getElementById('searchInput').value.toLowerCase();
+    const filtered = events.filter(ev => {
+      const cat = EVENT_CATEGORIES[ev.event] || 'issue';
+      if (!activeFilters.has(cat)) return false;
+      if (search && !(ev.event + ' ' + JSON.stringify(ev.data || {})).toLowerCase().includes(search)) return false;
+      return true;
+    });
+
+    if (filtered.length === 0) {
+      return '<div class="empty-state"><h2>No matching events</h2><p>Adjust filters or search</p></div>';
+    }
+
+    return '<div class="timeline">' + filtered.map((ev, i) => {
+      const color = EVENT_COLORS[ev.event] || 'gray';
+      const summary = eventSummary(ev);
+      const dataStr = ev.data && Object.keys(ev.data).length > 0 ? JSON.stringify(ev.data, null, 2) : '';
+      return '<div class="timeline-event color-' + color + '">' +
+        '<div class="time" title="' + escapeHtml(ev.ts || '') + '">' + formatTime(ev.ts) + '</div>' +
+        '<div class="dot-line"><div class="dot"></div><div class="line"></div></div>' +
+        '<div class="card" onclick="this.classList.toggle(\'expanded\')">' +
+          '<span class="event-name">' + escapeHtml(ev.event || '?') + '</span>' +
+          (ev.run_id ? '<span class="event-run">' + escapeHtml(ev.run_id) + '</span>' : '') +
+          (summary ? '<div class="event-summary">' + escapeHtml(summary) + '</div>' : '') +
+          (dataStr ? '<div class="event-data">' + escapeHtml(dataStr) + '</div>' : '') +
+        '</div>' +
+        '</div>';
+    }).join('') + '</div>';
+  }
+
+  // Render swimlane view
+  function renderSwimlanes(events) {
+    const search = document.getElementById('searchInput').value.toLowerCase();
+    const filtered = events.filter(ev => {
+      const cat = EVENT_CATEGORIES[ev.event] || 'issue';
+      if (!activeFilters.has(cat)) return false;
+      if (search && !(ev.event + ' ' + JSON.stringify(ev.data || {})).toLowerCase().includes(search)) return false;
+      return true;
+    });
+
+    // Collect lanes
+    const laneSet = new Set();
+    laneSet.add('_orchestrator');
+    filtered.forEach(ev => {
+      const lane = swimlaneFor(ev);
+      laneSet.add(lane);
+    });
+    const lanes = Array.from(laneSet);
+
+    // Header
+    let html = '<div class="swimlanes"><div class="swimlane-header">' +
+      '<div class="swim-time-col"></div>' +
+      lanes.map(l => '<div class="swimlane-label">' + escapeHtml(l === '_orchestrator' ? 'Orchestrator' : l) + '</div>').join('') +
+      '</div>';
+
+    // Rows
+    filtered.forEach(ev => {
+      const lane = swimlaneFor(ev);
+      const color = EVENT_COLORS[ev.event] || 'gray';
+      const dataStr = ev.data && Object.keys(ev.data).length > 0 ? JSON.stringify(ev.data, null, 2) : '';
+      html += '<div class="swimlane-row">' +
+        '<div class="swim-time-col" title="' + escapeHtml(ev.ts || '') + '">' + formatTime(ev.ts) + '</div>';
+      lanes.forEach(l => {
+        if (l === lane) {
+          html += '<div class="swimlane-cell"><div class="swim-event color-' + color + '" style="border-left-color:' + dotColor(color) + '" onclick="this.classList.toggle(\'expanded\')">' +
+            '<span class="swim-name">' + escapeHtml(ev.event) + '</span>' +
+            '<span class="swim-time">' + escapeHtml(eventSummary(ev)) + '</span>' +
+            (dataStr ? '<div class="swim-data">' + escapeHtml(dataStr) + '</div>' : '') +
+            '</div></div>';
+        } else {
+          html += '<div class="swimlane-cell"></div>';
+        }
+      });
+      html += '</div>';
+    });
+
+    html += '</div>';
+    return html;
+  }
+
+  function dotColor(c) {
+    const map = { green: '#4caf50', red: '#f44336', blue: '#2196f3', orange: '#ff9800', purple: '#9c27b0', gray: '#607d8b' };
+    return map[c] || map.gray;
+  }
+
+  // Render content
+  function renderContent() {
+    const content = document.getElementById('content');
+    if (!selectedFile || !traces[selectedFile]) {
+      content.innerHTML = '<div class="empty-state"><h2>Select a trace file</h2><p>Choose a trace from the sidebar to view its events</p></div>';
+      return;
+    }
+    const events = traces[selectedFile];
+    const showSwimlane = hasSubtaskEvents(events);
+    document.getElementById('viewToggle').style.display = showSwimlane ? 'flex' : 'none';
+
+    if (currentView === 'swimlane' && showSwimlane) {
+      content.innerHTML = renderSwimlanes(events);
+    } else {
+      content.innerHTML = renderTimeline(events);
+    }
+  }
+
+  function escapeHtml(s) {
+    if (!s) return '';
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  // Refresh data
+  async function refresh() {
+    const files = await fetchTraceFiles();
+    for (const f of files) {
+      traces[f] = await fetchAndParseTrace(f);
+    }
+    // Remove files no longer present
+    for (const f of Object.keys(traces)) {
+      if (!files.includes(f)) delete traces[f];
+    }
+    renderSidebar();
+    renderContent();
+  }
+
+  // Public API
+  window._selectTrace = function(filename) {
+    selectedFile = filename;
+    renderSidebar();
+    renderContent();
+  };
+
+  window.toggleFilter = function(el) {
+    const cat = el.dataset.cat;
+    if (activeFilters.has(cat)) {
+      activeFilters.delete(cat);
+      el.classList.remove('active');
+    } else {
+      activeFilters.add(cat);
+      el.classList.add('active');
+    }
+    renderContent();
+  };
+
+  window.setView = function(view, btn) {
+    currentView = view;
+    document.querySelectorAll('.view-toggle button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    renderContent();
+  };
+
+  // Search input
+  document.getElementById('searchInput').addEventListener('input', () => renderContent());
+
+  // Auto-refresh toggle
+  document.getElementById('autoRefresh').addEventListener('change', function() {
+    if (this.checked) {
+      refreshTimer = setInterval(refresh, 5000);
+    } else {
+      clearInterval(refreshTimer);
+      refreshTimer = null;
+    }
+  });
+
+  // Auto-select from URL hash
+  function checkHash() {
+    const hash = window.location.hash.substring(1);
+    if (hash) {
+      const match = Object.keys(traces).find(f => f.includes(hash));
+      if (match) {
+        selectedFile = match;
+        renderSidebar();
+        renderContent();
+      }
+    }
+  }
+
+  // Initial load
+  refresh().then(() => {
+    checkHash();
+    // Auto-select first if none selected
+    if (!selectedFile && Object.keys(traces).length > 0) {
+      selectedFile = Object.keys(traces).sort()[0];
+      renderSidebar();
+      renderContent();
+    }
+  });
+
+})();
+</script>
+</body>
+</html>

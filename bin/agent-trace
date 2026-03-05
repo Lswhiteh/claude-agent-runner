@@ -1,0 +1,187 @@
+#!/bin/bash
+# agent-trace — CLI tool for querying JSONL event traces from claude-agent-runner
+#
+# Usage:
+#   agent-trace list                    List all trace files with event counts and time range
+#   agent-trace show <identifier>       Pretty-print events (jq colored)
+#   agent-trace tail <identifier>       Live-tail events as they're emitted
+#   agent-trace view [identifier]       Start HTTP viewer in browser
+#   agent-trace help                    Show this help
+#
+# Requires: jq (for show)
+
+set -uo pipefail
+
+TRACES_DIR="$HOME/.config/claude-agents/traces"
+
+# Resolve viewer HTML path (sibling to this script)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VIEWER_HTML="$SCRIPT_DIR/agent-trace-viewer.html"
+
+usage() {
+  cat <<'EOF'
+agent-trace — Query JSONL event traces from claude-agent-runner
+
+Usage:
+  agent-trace list                    List all trace files with event counts and time range
+  agent-trace show <identifier>       Pretty-print events (jq colored)
+  agent-trace tail <identifier>       Live-tail events as they're emitted
+  agent-trace view [identifier]       Start HTTP viewer in browser
+  agent-trace help                    Show this help
+
+Trace files live in: ~/.config/claude-agents/traces/
+EOF
+}
+
+# Find a trace file matching a partial identifier
+find_trace() {
+  local QUERY="$1"
+  local MATCH=""
+  local COUNT=0
+
+  for f in "$TRACES_DIR"/*.jsonl; do
+    [ -f "$f" ] || continue
+    local base
+    base=$(basename "$f")
+    if [ "$base" = "${QUERY}.jsonl" ] || [[ "$base" == *"${QUERY}"* ]]; then
+      MATCH="$f"
+      COUNT=$((COUNT + 1))
+    fi
+  done
+
+  if [ "$COUNT" -eq 0 ]; then
+    echo "No trace file matching: $QUERY" >&2
+    echo "Run 'agent-trace list' to see available traces." >&2
+    return 1
+  elif [ "$COUNT" -gt 1 ]; then
+    echo "Multiple matches for '$QUERY':" >&2
+    for f in "$TRACES_DIR"/*.jsonl; do
+      [ -f "$f" ] || continue
+      local base
+      base=$(basename "$f")
+      if [[ "$base" == *"${QUERY}"* ]]; then
+        echo "  ${base%.jsonl}" >&2
+      fi
+    done
+    return 1
+  fi
+
+  echo "$MATCH"
+}
+
+cmd_list() {
+  if [ ! -d "$TRACES_DIR" ] || [ -z "$(ls -A "$TRACES_DIR"/*.jsonl 2>/dev/null)" ]; then
+    echo "No trace files found in $TRACES_DIR"
+    return 0
+  fi
+
+  printf "%-40s  %6s  %-20s  %-20s\n" "IDENTIFIER" "EVENTS" "FIRST" "LAST"
+  printf "%-40s  %6s  %-20s  %-20s\n" "----------" "------" "-----" "----"
+
+  for f in "$TRACES_DIR"/*.jsonl; do
+    [ -f "$f" ] || continue
+    local base count first last
+    base=$(basename "$f" .jsonl)
+    count=$(wc -l < "$f" | tr -d ' ')
+    first=$(head -1 "$f" 2>/dev/null | grep -o '"ts":"[^"]*"' | head -1 | cut -d'"' -f4)
+    last=$(tail -1 "$f" 2>/dev/null | grep -o '"ts":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+    # Truncate timestamps to readable form
+    first="${first:0:19}"
+    last="${last:0:19}"
+
+    printf "%-40s  %6s  %-20s  %-20s\n" "$base" "$count" "${first:-?}" "${last:-?}"
+  done
+}
+
+cmd_show() {
+  local QUERY="${1:-}"
+  if [ -z "$QUERY" ]; then
+    echo "Usage: agent-trace show <identifier>" >&2
+    return 1
+  fi
+
+  local TRACE_FILE
+  TRACE_FILE=$(find_trace "$QUERY") || return 1
+
+  if command -v jq &>/dev/null; then
+    # Pretty-print each line with jq
+    while IFS= read -r line; do
+      echo "$line" | jq '.'
+    done < "$TRACE_FILE"
+  else
+    cat "$TRACE_FILE"
+  fi
+}
+
+cmd_tail() {
+  local QUERY="${1:-}"
+  if [ -z "$QUERY" ]; then
+    echo "Usage: agent-trace tail <identifier>" >&2
+    return 1
+  fi
+
+  local TRACE_FILE
+  TRACE_FILE=$(find_trace "$QUERY") || return 1
+
+  echo "Tailing: $TRACE_FILE"
+  echo "Press Ctrl-C to stop"
+  echo ""
+
+  if command -v jq &>/dev/null; then
+    tail -f "$TRACE_FILE" | while IFS= read -r line; do
+      echo "$line" | jq '.' 2>/dev/null || echo "$line"
+    done
+  else
+    tail -f "$TRACE_FILE"
+  fi
+}
+
+cmd_view() {
+  local HASH="${1:-}"
+
+  if [ ! -d "$TRACES_DIR" ]; then
+    mkdir -p "$TRACES_DIR"
+  fi
+
+  if [ ! -f "$VIEWER_HTML" ]; then
+    echo "Viewer HTML not found at: $VIEWER_HTML" >&2
+    echo "Re-run setup.sh to install it." >&2
+    return 1
+  fi
+
+  # Copy viewer into traces dir
+  cp "$VIEWER_HTML" "$TRACES_DIR/index.html"
+
+  local PORT=7842
+  local URL="http://127.0.0.1:${PORT}/"
+  if [ -n "$HASH" ]; then
+    URL="${URL}#${HASH}"
+  fi
+
+  echo "Starting trace viewer at: $URL"
+  echo "Press Ctrl-C to stop"
+
+  # Open browser (macOS or Linux)
+  if command -v open &>/dev/null; then
+    open "$URL"
+  elif command -v xdg-open &>/dev/null; then
+    xdg-open "$URL"
+  fi
+
+  # Start HTTP server (foreground, Ctrl-C to stop)
+  cd "$TRACES_DIR"
+  python3 -m http.server "$PORT" --bind 127.0.0.1 2>/dev/null
+}
+
+# --- Main ---
+
+case "${1:-}" in
+  list)    cmd_list ;;
+  show)    shift; cmd_show "$@" ;;
+  tail)    shift; cmd_tail "$@" ;;
+  view)    shift; cmd_view "$@" ;;
+  help|-h|--help) usage ;;
+  "")      usage ;;
+  *)       echo "Unknown command: $1" >&2; usage; exit 1 ;;
+esac

@@ -166,6 +166,7 @@ fi
 
 mkdir -p "$HOME/.config/claude-agents/logs"
 mkdir -p "$HOME/.config/claude-agents/locks"
+mkdir -p "$HOME/.config/claude-agents/traces"
 
 # Create secrets.env placeholder if missing
 SECRETS_FILE="$HOME/.config/claude-agents/secrets.env"
