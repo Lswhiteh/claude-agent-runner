@@ -178,6 +178,18 @@ settings:
   trace: true                        # emit enforcement.* trace events
   log_file: ~/.config/claude-agents/logs/enforcement.log  # outside project tree to avoid git noise
 
+  # Rule auto-updating settings
+  auto_evolve:
+    auto_escalate:
+      enabled: true
+      threshold: 5                   # consecutive self-corrections before proposing escalation
+      cooldown: 7d                   # don't re-evaluate for 7 days after escalation
+      auto_apply: false              # true = apply without prompting (autonomous mode default)
+    check_downgrade:
+      enabled: false                 # v2 — LLM-to-deterministic conversion (requires meta-analysis)
+    guidance_suggest:
+      enabled: false                 # v2 — CLAUDE.md injection suggestions (requires cross-session data)
+
 rules:
   # Each rule requires: name, description, check, level
   # Optional: files, exclude, pattern, rule, prompt, phase
@@ -235,6 +247,109 @@ jq -r '.rules[] | select(.level == "block") | select(.files | test("src/routes")
 ```
 
 Cache the JSON in `/tmp/enforce-<config-hash>.json`. Invalidate when the config file's mtime changes. This avoids the fragility of flattening YAML arrays-of-objects into shell variables.
+
+### Rule Auto-Evolution
+
+Rules should tighten and cheapen over time as the system observes patterns. Three mechanisms, in order of automation maturity:
+
+**The progression:**
+
+```
+LLM warn (expensive, catches everything)
+    |  pattern stabilizes
+    v
+grep/biome warn (cheap, deterministic)
+    |  agent always self-corrects
+    v
+grep/biome block (prevent it entirely)
+    +  CLAUDE.md guidance (prevent agent from even trying)
+```
+
+Rules start expensive and permissive, then naturally tighten and cheapen as the system learns.
+
+#### v1: Auto-Escalation (fully automatic)
+
+When `agent-harness status` detects a `warn` rule has been self-corrected N times consecutively with zero overrides, it proposes escalation to `block`.
+
+**Trigger:** N consecutive `self_corrected` events for the same rule with zero `override` events in between (default N=5, configurable via `settings.auto_evolve.auto_escalate.threshold`).
+
+**Behavior by mode:**
+- **Interactive (dispatch):** prompts the developer — "Rule `no-console-log` has been self-corrected 8/8 times. Escalate to `block`? [y/n]"
+- **Autonomous (runner):** if `auto_apply: true`, modifies enforcement.yaml directly and commits the change. If `false`, logs the recommendation.
+
+**Safety:** Only escalates `warn → block`. Never auto-escalates `info → warn` (that would increase context noise without developer consent). Cooldown period prevents re-evaluation thrash.
+
+**Trace events:**
+```jsonl
+{"ts":"...","cat":"enforcement","event":"rule.escalated","rule":"no-console-log","from":"warn","to":"block","reason":"8/8 self-corrected, 0 overrides","auto":true}
+```
+
+#### v2: Check-Type Downgrade (semi-automatic)
+
+When an LLM rule consistently fires on structurally similar code, Haiku analyzes its own violation history and proposes a deterministic replacement.
+
+**Trigger:** An LLM rule fires 5+ times and the violations show a recognizable pattern.
+
+**Process:**
+1. `agent-harness` collects recent violations for the rule (file, line, code snippet)
+2. Sends them to Haiku with the prompt: "You've flagged these N violations. Can this be expressed as a grep pattern or biome rule instead of an LLM check?"
+3. If Haiku produces a pattern, the system proposes adding a grep/biome rule and optionally retiring the LLM rule
+
+**Output example:**
+```yaml
+# AUTO-GENERATED from LLM rule "service-layer-boundary"
+# Based on 6 consistent violations (2026-03-01 to 2026-03-11)
+- name: no-prisma-in-routes
+  description: "Direct Prisma calls in route handlers — use service layer"
+  check: grep
+  pattern: "prisma\\.\\w+\\.\\w+\\("
+  files: "src/routes/**/*.ts"
+  level: warn
+  derived_from: service-layer-boundary   # lineage tracking
+```
+
+**Safety:** Always proposes, never auto-applies. The developer reviews and merges. The original LLM rule can remain as a catch-all for violations the grep pattern misses.
+
+**Trace events:**
+```jsonl
+{"ts":"...","cat":"enforcement","event":"rule.downgraded","rule":"service-boundary","from":"llm","to":"grep","new_pattern":"prisma\\.\\w+","proposed":true}
+```
+
+#### v2/v3: CLAUDE.md Guidance Injection (preventive)
+
+When a rule fires repeatedly across multiple sessions, the system suggests adding guidance to the relevant feature-level CLAUDE.md so agents avoid the violation entirely.
+
+**Trigger:** A rule fires N+ times across M+ distinct sessions (thresholds TBD, likely 10+ fires across 5+ sessions).
+
+**Process:**
+1. `agent-harness status` identifies high-frequency rules
+2. Determines the most specific CLAUDE.md location (e.g., `src/routes/CLAUDE.md` for a routes-scoped rule)
+3. Proposes guidance text:
+
+```
+Rule "no-prisma-in-routes" has fired 14 times across 6 sessions.
+Suggest adding to src/routes/CLAUDE.md:
+
+  "Route handlers must not call Prisma directly.
+   Import from src/services/ instead. See src/services/user-service.ts
+   for the pattern."
+```
+
+**Safety:** Suggestion only — never auto-modifies CLAUDE.md files. These are developer-authored guidance and should stay under human control.
+
+**Trace events:**
+```jsonl
+{"ts":"...","cat":"enforcement","event":"guidance.suggested","rule":"no-prisma-in-routes","target":"src/routes/CLAUDE.md","fires":14,"sessions":6}
+```
+
+#### Evolution Lifecycle Summary
+
+| Phase | Mechanism | Automation | Version |
+|---|---|---|---|
+| Detect | LLM-judged rule fires as `warn` | Automatic | v1 |
+| Tighten | Auto-escalate `warn → block` after consistent self-correction | Auto (with opt-in) | v1 |
+| Cheapen | Downgrade LLM check to grep/biome | Proposed, human applies | v2 |
+| Prevent | Suggest CLAUDE.md guidance to avoid violations entirely | Proposed, human applies | v2/v3 |
 
 ### Pre-Hook Grep Targets
 
@@ -469,6 +584,9 @@ Extends the existing JSONL trace format with enforcement events:
 | `rule.skipped` | LLM check timed out or errored | rule, file, reason |
 | `self_corrected` | Agent fixed a warn violation | rule, file, detail |
 | `override` | Human explicitly bypassed a rule | rule, file, reason |
+| `rule.escalated` | Rule level auto-upgraded | rule, from, to, reason, auto (bool) |
+| `rule.downgraded` | Check type converted (LLM→grep) | rule, from, to, new_pattern, proposed (bool) |
+| `guidance.suggested` | CLAUDE.md guidance proposed | rule, target, fires, sessions |
 
 ### Self-Correction Detection
 
@@ -570,7 +688,10 @@ config/
 10. **Linear CLI migration** — swap GraphQL calls for linear-cli incrementally.
 11. **lib/ extraction** — consolidate shared functions once dispatch and runner interfaces stabilize.
 12. **Self-correction detection** — track warn → fix patterns.
-13. **Viewer updates** — enforcement events in trace viewer.
+13. **Auto-escalation (v1)** — threshold-based warn→block promotion from self-correction data.
+14. **Viewer updates** — enforcement events in trace viewer.
+15. **Check-type downgrade (v2)** — Haiku meta-analysis to convert LLM rules to grep/biome.
+16. **CLAUDE.md guidance injection (v2/v3)** — cross-session aggregation to suggest preventive guidance.
 
 ## Open Questions
 
