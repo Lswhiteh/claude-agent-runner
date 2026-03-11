@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.4.9",
+  "checkpoint_id": "7a98a3170510",
+  "session_id": "31134e35-1aea-4009-86f7-5dd2392c02d4",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-11T22:19:28.294067Z",
+  "branch": "main",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "docs/superpowers/specs/2026-03-11-agent-harness-framework-design.md"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "0bf834406b69",
+  "checkpoint_transcript_start": 285,
+  "transcript_lines_at_start": 285,
+  "token_usage": {
+    "input_tokens": 17,
+    "cache_creation_tokens": 9008,
+    "cache_read_tokens": 1046971,
+    "output_tokens": 5312,
+    "api_call_count": 13
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-11T22:19:27.652575Z",
+    "agent_lines": 122,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 122,
+    "agent_percentage": 100
+  }
+}
