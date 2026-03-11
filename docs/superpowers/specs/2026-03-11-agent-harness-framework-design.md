@@ -1,0 +1,547 @@
+# Agent Harness Framework — Design Spec
+
+**Date:** 2026-03-11
+**Status:** Draft
+**Scope:** Generalizable enforcement layer, interactive dispatch mode, validation instrumentation
+
+## Problem
+
+The claude-agent-runner has strong autonomous capabilities (worktree isolation, CI gating, Linear integration, orchestration), but the enforcement and feedback mechanisms are hardcoded as individual hooks with no per-project configurability. There's no interactive mode — the only entry point is Linear polling. And there's no systematic way to measure whether the guardrails are actually improving agent output quality.
+
+Three gaps:
+
+1. **Enforcement is not configurable.** Hooks like `block-destructive.sh` and `stop-gate.sh` are general-purpose but can't be tuned per-project. There's no way for a project to declare "enforce service layer boundaries" or "block direct env access outside config" without writing custom hooks.
+
+2. **No interactive mode.** Developers must create a Linear issue and wait for the poller. There's no way to invoke the runner's infrastructure (worktree setup, hooks, CI gate, PR creation) from within a Claude Code session.
+
+3. **No validation loop.** The tracer logs events but doesn't track enforcement effectiveness — rule fire rates, self-correction rates, false positives, impact on CI pass rates or review rounds.
+
+## Design Principles
+
+- **Constraints > instructions.** Deterministic enforcement (hooks) over advisory guidance (CLAUDE.md). CLAUDE.md says what to do; hooks ensure it happens.
+- **Cheapest tool that works.** Grep before AST, AST before LLM. Each level adds cost and nondeterminism.
+- **Linear is the spine.** Both autonomous and interactive modes use Linear for tracking. The CLI wrapper makes this token-efficient.
+- **Repo owns enforcement.** Rules live in the repo, not in Linear or external config. Version-controlled, auditable, PR-reviewable.
+- **Measure the system.** Every enforcement action is traced. The harness validates its own effectiveness.
+
+## Architecture Overview
+
+```
++-----------------------------------------------------+
+|                    TRIGGER LAYER                     |
+|                                                      |
+|   Autonomous (poll)          Interactive (skill)     |
+|   +---------------+         +-------------------+   |
+|   | Linear poll   |         | /dispatch ENG-123 |   |
+|   | labeled       |         | /dispatch "idea"  |   |
+|   | issues        |         |                   |   |
+|   +-------+-------+         +---------+---------+   |
+|           |                           |              |
+|           +-----------+---------------+              |
+|                       v                              |
+|            +------------------+                      |
+|            |   linear-cli     |  (schpet/linear-cli) |
+|            |   create / read  |                      |
+|            |   update / comment|                     |
+|            +--------+---------+                      |
++-----------------------+-------------------------------+
+                        v
++-------------------------------------------------------+
+|                  EXECUTION LAYER                       |
+|                                                        |
+|   +-------------+  +--------------+  +---------------+ |
+|   |  Worktree   |  |   Docker     |  |    Claude     | |
+|   |  isolation   |  |  isolation   |  |   session(s)  | |
+|   +-------------+  +--------------+  +---------------+ |
++-------------------------------------------------------+
+                        v
++-------------------------------------------------------+
+|                ENFORCEMENT LAYER                       |
+|         (generalizable harness)                        |
+|                                                        |
+|   Per-project config:  .claude/enforcement.yaml        |
+|                                                        |
+|   +-----------+  +-----------+  +-------------------+  |
+|   |   BLOCK   |  |   WARN    |  |      INFO         |  |
+|   |           |  |           |  |                    |  |
+|   | rm -rf    |  | pattern   |  | telemetry          |  |
+|   | force push|  | violation |  | style drift        |  |
+|   | no tests  |  | wrong     |  | unused pattern     |  |
+|   | raw SQL   |  | layer     |  |                    |  |
+|   +-----------+  +-----------+  +-------------------+  |
+|                                                        |
+|   Built-in (general):      Project rules (per-repo):   |
+|   - block-destructive      - .claude/enforcement.yaml  |
+|   - stop-gate              - .claude/patterns/*.md     |
+|   - command-budget         - feature-level CLAUDE.md   |
+|   - scope-guard            - .claude/orchestrator/     |
++-------------------------------------------------------+
+                        v
++-------------------------------------------------------+
+|              VALIDATION & TRACING                      |
+|                                                        |
+|   +-----------------------------------------------+   |
+|   |              Event Trace (JSONL)               |   |
+|   |                                                |   |
+|   |  issue.*  agent.*  enforcement.*  ci.*         |   |
+|   |  pr.*     review.*  orchestration.*  cleanup.* |   |
+|   +-------------------------+---------------------+   |
+|                             v                          |
+|   +-----------------------------------------------+   |
+|   |           Metrics / Dashboard                  |   |
+|   |                                                |   |
+|   |  - Rule fire rate (block/warn/info)            |   |
+|   |  - Self-correction rate (warn -> agent fixed)  |   |
+|   |  - CI pass rate (first push)                   |   |
+|   |  - Time-to-merge                               |   |
+|   |  - False positive rate (human overrides)       |   |
+|   +-----------------------------------------------+   |
++-------------------------------------------------------+
+```
+
+## Component 1: Enforcement Layer
+
+### Hook Structure
+
+Two new hooks sharing a library, plus the existing hooks which become "built-in rules":
+
+```
+hooks/
+  enforce-pre.sh      # PreToolUse:Edit,Write — synchronous, can block
+  enforce-post.sh     # PostToolUse:Edit,Write — async, injects context
+  enforce-lib.sh      # shared: YAML parsing, rule matching, check runners
+```
+
+**`enforce-pre.sh`** — fires before Edit/Write actions. Evaluates only `block`-level rules using deterministic checks (grep, biome). If any fire, exits with code 2 and a violation message. The agent sees the block and self-corrects.
+
+**`enforce-post.sh`** — fires after Edit/Write actions complete. Evaluates `warn` and `info` rules across all check types, including LLM. Outputs violations as `additionalContext` for warn-level. Appends info-level to `.claude/enforcement.log`. Emits trace events.
+
+**First iteration scope:** Only enforce on Edit and Write tools where the file path is explicit. Bash-level enforcement stays in existing hooks (`block-destructive.sh`, `scope-guard.sh`). Bash commands are too varied to reliably determine affected files.
+
+### Check Types
+
+Three tiers, escalate only when needed:
+
+**1. Grep (pattern matching)**
+- Near-zero cost, instant execution
+- Good for: import restrictions, banned function calls, env access patterns, logging statements
+- Runs in both pre and post hooks
+
+**2. Biome / linter (AST-aware)**
+- Structural code analysis, understands syntax not just text
+- Good for: export style, nesting depth, hook call rules, naming conventions
+- Runs in both pre and post hooks
+- Uses whatever linter the project already has configured (biome, eslint, ruff)
+
+**3. LLM-judged (Haiku)**
+- Semantic understanding of code intent and architecture
+- Good for: layer boundary violations, single responsibility, architectural fit
+- Runs in post hook only (async) — too slow for blocking
+- Calls Anthropic API directly via `curl`
+- 3-second timeout — skip gracefully if API is slow
+- Cost: ~$0.0004 per check (1K tokens in, 100 tokens out)
+
+### Enforcement Levels
+
+**`block`** — Hook exits non-zero (code 2). Action is denied. Agent sees the error message and must self-correct before proceeding. Only for deterministic checks (grep, biome) — never LLM, since nondeterministic blocks would be frustrating.
+
+**`warn`** — Action proceeds. Violation message injected as context on the agent's next turn via stdout. Agent is expected to self-correct. If it doesn't, the violation is logged and visible in traces.
+
+**`info`** — Action proceeds silently. Violation appended to `.claude/enforcement.log`. Available for auditing and metrics but doesn't pollute agent context. Useful for tracking style drift over time.
+
+### enforcement.yaml Schema
+
+Location: `.claude/enforcement.yaml` in the project root.
+
+```yaml
+version: 1
+
+# Override built-in hook behavior
+builtins:
+  command-budget: 500              # override default 300
+  block-destructive: true          # true | false
+  stop-gate: block                 # block | warn | off
+  scope-guard: true                # true | false
+
+# Global settings for the enforcement system
+settings:
+  llm:
+    model: claude-haiku-4-5-20251001
+    api_key_env: ANTHROPIC_API_KEY   # env var name, never the key itself
+    max_tokens: 200
+    timeout: 3                       # seconds — skip check if exceeded
+  cache_ttl: 300                     # seconds to cache parsed config
+  trace: true                        # emit enforcement.* trace events
+  log_file: .claude/enforcement.log
+
+rules:
+  # Each rule requires: name, description, check, level
+  # Optional: files, exclude, pattern, rule, prompt, phase
+
+  - name: <identifier>               # unique, kebab-case
+    description: "<why this rule exists>"
+    check: grep | biome | llm
+    level: block | warn | info
+
+    # For grep checks:
+    pattern: "<regex>"
+
+    # For biome checks:
+    rule: "<biome-rule-name>"
+
+    # For llm checks:
+    prompt: |
+      <prompt text sent to Haiku along with the file diff>
+
+    # File targeting (all check types):
+    files: "glob/pattern/**/*.ts"    # which files this rule applies to
+    exclude: "**/*.test.ts"          # files to skip
+
+    # Orchestration (optional):
+    phase: integration               # only runs during parent integration check
+```
+
+### Nested Ticket Enforcement
+
+Child issues inherit repo-level enforcement rules naturally — rules match by file glob, and scope-guard limits which files each child can touch. A child working in `src/routes/dashboard/*` only triggers rules with matching file globs.
+
+Parent-level integration rules live in `.claude/orchestrator/<ISSUE-ID>/enforcement.yaml` with `phase: integration`. These run only during the parent's integration validation after all children complete.
+
+```
+.claude/
+  enforcement.yaml                           # repo-wide rules
+  orchestrator/
+    ENG-100/
+      enforcement.yaml                       # integration-phase rules for ENG-100
+```
+
+### YAML Parsing
+
+Use `yq` (single binary, no dependencies) to parse enforcement.yaml. Cache parsed output as shell variables in `/tmp/enforce-<config-hash>.sh` to avoid re-parsing on every hook invocation. Invalidate when the config file's mtime changes.
+
+## Component 2: `agent-harness` CLI
+
+Location: `bin/agent-harness`
+
+### Subcommands
+
+**`agent-harness init`**
+Bootstraps `.claude/enforcement.yaml` for a project.
+
+1. Detect stack — reuse `ci-gate`'s language/framework detection logic
+2. Scan for existing linters — check for `biome.json`, `.eslintrc*`, `ruff.toml`, `pyproject.toml`, `.golangci.yml`
+3. Scan directory structure — identify layer patterns (`routes/`, `services/`, `components/`, `lib/`, `db/`)
+4. Call Haiku — send directory tree + sample of key files, ask it to identify architectural patterns, naming conventions, layer boundaries, and suggest enforcement rules
+5. Generate `.claude/enforcement.yaml` with rules at appropriate check types and levels
+6. Generate `.claude/patterns/` directory with markdown docs explaining each rule's rationale
+7. Print summary, remind developer to review before activating
+
+**`agent-harness check [file|dir]`**
+Run enforcement rules manually against specified files.
+
+```
+$ agent-harness check src/routes/users.ts
+
+  BLOCK  no-env-access         line 12: process.env.DATABASE_URL
+  WARN   service-boundary      LLM: "Direct Prisma query in route handler"
+  INFO   prefer-named-export   line 1: default export
+
+  1 block, 1 warn, 1 info
+```
+
+Runs all three check types. Useful for:
+- Manual verification during development
+- CI integration: `agent-harness check src/` as a pipeline step
+- Validating rules after editing enforcement.yaml
+
+**`agent-harness status [--last <period>]`**
+Aggregate enforcement metrics from traces.
+
+```
+$ agent-harness status --last 7d
+
+Rules active: 8 (2 block, 4 warn, 2 info)
+
+Last 7 days across 12 agent sessions:
+  Rule                    Fired   Blocked   Self-corrected   Override
+  no-env-access             3        3          -               0
+  no-console-log           14        -         12               2
+  service-boundary          7        -          5               2
+  component-srp             2        -          1               1
+
+  CI first-push pass rate:  78% (was 61% before enforcement)
+  Avg review rounds:        1.4 (was 2.3)
+```
+
+**`agent-harness trace`**
+Passthrough to existing `agent-trace` CLI. Convenience alias.
+
+### Implementation
+
+Bash script, consistent with the rest of the project. Sources `enforce-lib.sh` for rule-running logic. Sources `ci-gate`'s detection functions for `init`.
+
+## Component 3: Interactive Dispatch Mode
+
+### Skill Definition
+
+Location: `skills/dispatch/`
+
+```markdown
+---
+name: dispatch
+description: Work on a Linear issue or free-form task with full harness enforcement
+arguments:
+  - name: target
+    description: Linear issue ID (ENG-123) or free-form task description
+---
+```
+
+### Flow
+
+**If target is a Linear issue ID:**
+1. `linear issue view <ID>` — fetch title, description, acceptance criteria
+2. Check for sub-issues: `linear issue list --parent <ID>`
+3. If sub-issues exist → smart routing (see below)
+4. If no sub-issues → single-issue flow
+
+**If target is free-form text:**
+1. `linear issue create --team <configured-default> --title "..." --label Agent`
+2. Capture the new issue ID
+3. Single-issue flow
+
+**Single-issue flow:**
+1. Create worktree: `git worktree add ~/.claude/worktrees/<repo>/issue-<ID> -b agent/<ID>`
+2. Check for `.claude/enforcement.yaml` — if missing, suggest `agent-harness init`
+3. Update Linear: `linear issue update <ID> --status "In Progress"`
+4. Work on the issue following the normal implementation workflow
+5. Hooks enforce rules automatically during the session
+6. Run `ci-gate` before pushing
+7. Push branch, create PR: `gh pr create` or `linear issue pr`
+8. Post implementation report: `linear comment add <ID> "..."`
+9. Update status: `linear issue update <ID> --status "In Review"`
+
+**Nested issue flow (smart routing — option C):**
+
+When the dispatched issue has sub-issues, analyze the dependency graph and present options:
+
+```
+ENG-100 has 3 sub-issues:
+  ENG-101: Dashboard API endpoints (no deps)
+  ENG-102: Dashboard UI components (depends on ENG-101)
+  ENG-103: Dashboard data migration (no deps)
+
+ENG-101 and ENG-103 can run in parallel.
+ENG-102 needs ENG-101 to finish first.
+
+Options:
+  1. Parallel: spawn agents for 101+103, then 102
+  2. Sequential: work through each in this session
+  3. Pick one to start with
+```
+
+For parallel execution, spawn sub-agents with scope enforcement. For sequential, work through in dependency order within the session. Either way, run parent-level integration checks after all children complete.
+
+### Shared Library Extraction
+
+Extract reusable functions from `bin/claude-agent-runner` into sourced libraries:
+
+```
+lib/
+  agent-core.sh        # worktree setup/teardown, env config, identity exports
+  agent-linear.sh      # Linear API functions (wraps linear-cli, falls back to curl)
+  agent-github.sh      # PR creation, review posting
+  agent-ci.sh          # ci-gate wrapper, retry-with-fix logic
+```
+
+Both `bin/claude-agent-runner` (autonomous) and `skills/dispatch/` (interactive) source these libraries. The runner's main loop and polling logic stay in the runner script; the dispatch skill drives the same functions conversationally.
+
+**Migration strategy:** Extract functions incrementally. Start with the functions dispatch needs (worktree setup, Linear issue fetch, PR creation). Refactor the runner to source from lib/ one section at a time. No big-bang rewrite.
+
+## Component 4: Linear CLI Integration
+
+### Tool Selection
+
+Use [schpet/linear-cli](https://github.com/schpet/linear-cli) directly.
+
+- Deno compiled to native binary — lightweight, no runtime dependencies
+- 406 commits, actively maintained
+- Covers: issue CRUD, comments, status updates, team listing, PR integration
+- Already has a Claude Code skill
+
+### Installation
+
+```bash
+brew install schpet/tap/linear
+```
+
+Add to `setup.sh` as an optional dependency check.
+
+### Usage Mapping
+
+| Operation | Command |
+|---|---|
+| Fetch issue | `linear issue view <ID>` |
+| Create issue | `linear issue create --team <T> --title "..." --label Agent` |
+| Update status | `linear issue update <ID> --status "In Progress"` |
+| Add comment | `linear comment add <ID> "..."` |
+| List by label | `linear issue list --label Agent` |
+| List children | `linear issue list --parent <ID>` |
+| Create child | `linear issue create --parent <ID> --team <T> --title "..."` |
+
+### Migration from Raw GraphQL
+
+The agent-runner's `linear_*` functions currently use raw `curl` + GraphQL. Migrate incrementally:
+
+```bash
+# Wrapper pattern during migration
+linear_get_issue() {
+  linear issue view "$1" --json 2>/dev/null || \
+    _linear_graphql_fallback "issue" "$1"    # existing curl implementation
+}
+```
+
+Replace each function as the CLI covers the need. Keep the fallback for any operations the CLI doesn't support yet (e.g., complex filtered queries, webhook management).
+
+### Token Savings
+
+MCP schema injection loads the full Linear API tool definitions every turn — hundreds of tokens of schema regardless of whether Linear tools are used. The CLI approach: zero tokens when not called, and only the output of the specific command when called. For a typical agent session that interacts with Linear 5-10 times, this saves thousands of tokens of schema overhead.
+
+## Component 5: Tracing & Validation
+
+### New Event Category: `enforcement`
+
+Extends the existing JSONL trace format with enforcement events:
+
+```jsonl
+{"ts":"2026-03-11T14:32:01Z","cat":"enforcement","event":"rule.checked","rule":"no-console-log","check":"grep","file":"src/routes/users.ts","result":"pass"}
+{"ts":"2026-03-11T14:32:01Z","cat":"enforcement","event":"rule.fired","rule":"no-env-access","check":"grep","file":"src/routes/users.ts","level":"block","line":42,"detail":"process.env.DATABASE_URL"}
+{"ts":"2026-03-11T14:32:05Z","cat":"enforcement","event":"rule.fired","rule":"service-boundary","check":"llm","file":"src/routes/users.ts","level":"warn","detail":"Direct Prisma call in route handler","model":"haiku","latency_ms":820}
+{"ts":"2026-03-11T14:32:08Z","cat":"enforcement","event":"self_corrected","rule":"service-boundary","file":"src/routes/users.ts","detail":"Agent moved query to UserService"}
+```
+
+### Event Types
+
+| Event | When | Fields |
+|---|---|---|
+| `rule.checked` | Any rule evaluated | rule, check, file, result (pass/fail) |
+| `rule.fired` | Rule violation detected | rule, check, file, level, line (if applicable), detail |
+| `rule.skipped` | LLM check timed out or errored | rule, file, reason |
+| `self_corrected` | Agent fixed a warn violation | rule, file, detail |
+| `override` | Human explicitly bypassed a rule | rule, file, reason |
+
+### Self-Correction Detection
+
+When a `warn`-level rule fires on a file, the enforcement hook records the file + rule. On the next Edit/Write to the same file, the hook re-runs the rule. If it passes, emit a `self_corrected` event. This measures how effectively warnings drive agent behavior.
+
+### Nested Ticket Tracing
+
+Every enforcement event includes an `issue` field (the Linear issue ID). For orchestrated work, also includes `parent` for child issues. This enables aggregation:
+
+```bash
+agent-trace show ENG-100                    # parent + all children
+agent-trace show ENG-100 --filter enforcement   # enforcement events only
+agent-harness status --issue ENG-100        # rollup across hierarchy
+```
+
+### Metrics
+
+`agent-harness status` computes from traces:
+
+- **Rule fire rate:** how often each rule triggers (per session, per time period)
+- **Block rate:** how often block-level rules prevent actions
+- **Self-correction rate:** percentage of warn-level violations the agent fixes without human intervention
+- **Override rate:** how often humans bypass rules (signal for rule refinement)
+- **CI first-push pass rate:** percentage of agent sessions where ci-gate passes on first attempt (tracks improvement over time)
+- **Time-to-merge:** from issue pickup to PR merge (tracks overall efficiency)
+
+### Viewer Integration
+
+Extend `agent-trace-viewer.html` to render enforcement events:
+- Color-coded by level (red=block, yellow=warn, gray=info)
+- Filter chip for enforcement category
+- Self-correction shown as paired events (warn → fix)
+
+## File Structure Changes
+
+```
+bin/
+  agent-harness              # NEW — CLI for init, check, status
+  claude-agent-runner        # MODIFIED — sources from lib/
+  ci-gate                    # UNCHANGED
+  agent-trace                # MODIFIED — enforcement filter support
+
+lib/                         # NEW — extracted shared functions
+  agent-core.sh              # worktree, env, identity
+  agent-linear.sh            # Linear CLI wrapper + fallback
+  agent-github.sh            # PR, review
+  agent-ci.sh                # ci-gate wrapper
+
+hooks/
+  enforce-pre.sh             # NEW — PreToolUse:Edit,Write
+  enforce-post.sh            # NEW — PostToolUse:Edit,Write
+  enforce-lib.sh             # NEW — shared enforcement logic
+  block-destructive.sh       # UNCHANGED (becomes built-in rule)
+  stop-gate.sh               # UNCHANGED (becomes built-in rule)
+  command-budget.sh          # UNCHANGED (becomes built-in rule)
+  scope-guard.sh             # UNCHANGED (becomes built-in rule)
+  # ... other existing hooks unchanged
+
+skills/
+  dispatch/                  # NEW — interactive mode skill
+
+config/
+  config.example.json        # MODIFIED — add enforcement defaults
+```
+
+## Per-Project Config Files
+
+```
+<project-root>/
+  .claude/
+    enforcement.yaml         # enforcement rules
+    enforcement.log          # info-level violation log
+    patterns/                # markdown docs explaining each rule's rationale
+      no-env-access.md
+      service-boundary.md
+      ...
+    orchestrator/
+      <ISSUE-ID>/
+        enforcement.yaml     # integration-phase rules for orchestrated issues
+```
+
+## Dependencies
+
+- **yq** — YAML parsing in bash (single binary, `brew install yq`)
+- **linear-cli** — Linear API access (`brew install schpet/tap/linear`)
+- **biome** (optional) — AST-level enforcement, only if project uses it
+- **Anthropic API key** — for LLM-judged rules (Haiku). Set via env var referenced in config.
+
+## Implementation Order
+
+1. **enforce-lib.sh + enforce-pre.sh + enforce-post.sh** — the core enforcement hooks with grep check support only. Get the hook mechanics, YAML parsing, and block/warn/info routing working.
+2. **enforcement.yaml schema** — define and validate the config format.
+3. **Biome check type** — add AST-level checking to the enforcement hooks.
+4. **LLM check type** — add Haiku-judged rules with timeout handling.
+5. **agent-harness check** — manual rule-running CLI.
+6. **Tracing integration** — emit enforcement.* events to JSONL traces.
+7. **agent-harness init** — project bootstrapper.
+8. **agent-harness status** — metrics aggregation from traces.
+9. **lib/ extraction** — pull shared functions out of agent-runner.
+10. **skills/dispatch/** — interactive mode skill.
+11. **Linear CLI migration** — swap GraphQL calls for linear-cli incrementally.
+12. **Self-correction detection** — track warn → fix patterns.
+13. **Viewer updates** — enforcement events in trace viewer.
+
+## Open Questions
+
+1. **Biome plugin authoring:** For projects that need custom AST rules beyond biome's built-in set, how much do we invest in authoring tooling? First iteration: only use rules biome already ships. Defer custom plugins.
+2. **LLM rule caching:** If the same file hasn't changed between edits, should we skip re-running LLM checks? Probably yes — cache by file content hash, invalidate on edit.
+3. **Rule dependencies:** Can one rule reference another? (e.g., "if no-raw-sql fires, also check for missing service layer") First iteration: no. Rules are independent.
+4. **Multi-language support:** enforcement.yaml rules with biome only work for JS/TS. Ruff for Python, clippy for Rust. Do we abstract the linter interface? First iteration: biome only. Add others as needed.
+
+## References
+
+- [Agent Backpressure](https://latentpatterns.com/glossary/agent-backpressure) — automated feedback mechanisms for agent self-correction
+- [Levels of Agentic Engineering](https://www.bassimeledath.com/blog/levels-of-agentic-engineering) — framework for AI-assisted coding maturity (levels 5-7 relevant)
+- [Dispatch](https://github.com/bassimeledath/dispatch) — Claude Code skill for multi-agent coordination (comparable system)
+- [schpet/linear-cli](https://github.com/schpet/linear-cli) — Linear CLI tool for token-efficient API access
