@@ -140,6 +140,7 @@ Three tiers, escalate only when needed:
 - Calls Anthropic API directly via `curl`
 - 3-second timeout — skip gracefully if API is slow
 - Cost: ~$0.0004 per check (1K tokens in, 100 tokens out)
+- Caches results by file content hash — skips re-check if file unchanged since last evaluation
 
 ### Enforcement Levels
 
@@ -162,6 +163,9 @@ builtins:
   block-destructive: true          # true | false
   stop-gate: block                 # block | warn | off
   scope-guard: true                # true | false
+  # Mechanism: built-in hooks source enforce-lib.sh and call
+  # enforce_builtin_level "stop-gate" to read their override.
+  # Returns "block"|"warn"|"off". Each hook adjusts behavior accordingly.
 
 # Global settings for the enforcement system
 settings:
@@ -169,10 +173,10 @@ settings:
     model: claude-haiku-4-5-20251001
     api_key_env: ANTHROPIC_API_KEY   # env var name, never the key itself
     max_tokens: 200
-    timeout: 3                       # seconds — skip check if exceeded
+    timeout: 5                       # seconds — skip check if exceeded (configurable per-project)
   cache_ttl: 300                     # seconds to cache parsed config
   trace: true                        # emit enforcement.* trace events
-  log_file: .claude/enforcement.log
+  log_file: ~/.config/claude-agents/logs/enforcement.log  # outside project tree to avoid git noise
 
 rules:
   # Each rule requires: name, description, check, level
@@ -207,6 +211,8 @@ Child issues inherit repo-level enforcement rules naturally — rules match by f
 
 Parent-level integration rules live in `.claude/orchestrator/<ISSUE-ID>/enforcement.yaml` with `phase: integration`. These run only during the parent's integration validation after all children complete.
 
+**Lifecycle:** Integration enforcement files are created by the orchestrator during issue decomposition and cleaned up when the parent PR is merged. The autonomous runner's cleanup phase already removes `.claude/orchestrator/<ID>/` directories; dispatch mode should do the same on PR merge.
+
 ```
 .claude/
   enforcement.yaml                           # repo-wide rules
@@ -217,7 +223,27 @@ Parent-level integration rules live in `.claude/orchestrator/<ISSUE-ID>/enforcem
 
 ### YAML Parsing
 
-Use `yq` (single binary, no dependencies) to parse enforcement.yaml. Cache parsed output as shell variables in `/tmp/enforce-<config-hash>.sh` to avoid re-parsing on every hook invocation. Invalidate when the config file's mtime changes.
+Use `yq` to convert enforcement.yaml to JSON once, then query with `jq` at invocation time. This is consistent with the existing codebase which already uses `jq` heavily.
+
+```bash
+# On first invocation (or when config mtime changes):
+yq -o json .claude/enforcement.yaml > /tmp/enforce-<config-hash>.json
+
+# Per-rule queries at hook time:
+jq -r '.rules[] | select(.level == "block") | select(.files | test("src/routes"))' \
+  /tmp/enforce-<config-hash>.json
+```
+
+Cache the JSON in `/tmp/enforce-<config-hash>.json`. Invalidate when the config file's mtime changes. This avoids the fragility of flattening YAML arrays-of-objects into shell variables.
+
+### Pre-Hook Grep Targets
+
+In `enforce-pre.sh`, the file has not been modified yet. The grep target depends on the tool:
+
+- **Edit operations:** grep against `tool_input.new_string` (the incoming content). The hook receives tool input as JSON on stdin.
+- **Write operations:** grep against `tool_input.content` (the full file content being written).
+
+In `enforce-post.sh`, the file exists on disk, so grep runs against the actual file. This distinction is important — pre-hooks check what's about to be written, post-hooks check what was written.
 
 ## Component 2: `agent-harness` CLI
 
@@ -231,10 +257,11 @@ Bootstraps `.claude/enforcement.yaml` for a project.
 1. Detect stack — reuse `ci-gate`'s language/framework detection logic
 2. Scan for existing linters — check for `biome.json`, `.eslintrc*`, `ruff.toml`, `pyproject.toml`, `.golangci.yml`
 3. Scan directory structure — identify layer patterns (`routes/`, `services/`, `components/`, `lib/`, `db/`)
-4. Call Haiku — send directory tree + sample of key files, ask it to identify architectural patterns, naming conventions, layer boundaries, and suggest enforcement rules
-5. Generate `.claude/enforcement.yaml` with rules at appropriate check types and levels
-6. Generate `.claude/patterns/` directory with markdown docs explaining each rule's rationale
-7. Print summary, remind developer to review before activating
+4. Generate baseline `.claude/enforcement.yaml` from deterministic scans (steps 1-3) — grep rules from detected patterns, biome rules from existing linter config
+5. Call Haiku (if API key available) — send directory tree + sample of key files, ask it to identify architectural patterns, layer boundaries, and suggest additional LLM-judged rules. If the API call fails or no key is configured, skip gracefully — the deterministic rules from step 4 are still useful on their own.
+6. Merge LLM suggestions into the enforcement.yaml
+7. Generate `.claude/patterns/` directory with markdown docs explaining each rule's rationale
+8. Print summary, remind developer to review before activating
 
 **`agent-harness check [file|dir]`**
 Run enforcement rules manually against specified files.
@@ -296,6 +323,16 @@ arguments:
 ---
 ```
 
+### Session Configuration
+
+The dispatch skill runs inside the user's existing Claude Code session. To activate enforcement hooks, the skill:
+
+1. Exports agent env vars (`CLAUDE_AGENT_MODE=1`, `CLAUDE_AGENT_ISSUE_ID`, `CLAUDE_AGENT_BRANCH`, `CLAUDE_AGENT_WORKTREE`) into the session
+2. Hooks read these env vars and activate accordingly (same gate pattern as autonomous mode)
+3. For parallel sub-agent work, dispatch spawns child Claude processes in worktrees (same as autonomous mode) — these get their own sessions with hooks active
+
+The key difference from autonomous mode: the user's session is the orchestrator, not a bash script. The user can steer, answer questions, and approve decisions interactively while hooks enforce rules automatically.
+
 ### Flow
 
 **If target is a Linear issue ID:**
@@ -355,7 +392,9 @@ lib/
 
 Both `bin/claude-agent-runner` (autonomous) and `skills/dispatch/` (interactive) source these libraries. The runner's main loop and polling logic stay in the runner script; the dispatch skill drives the same functions conversationally.
 
-**Migration strategy:** Extract functions incrementally. Start with the functions dispatch needs (worktree setup, Linear issue fetch, PR creation). Refactor the runner to source from lib/ one section at a time. No big-bang rewrite.
+**Migration strategy:** Defer full lib/ extraction to a separate effort. For the first iteration, the dispatch skill duplicates the small number of functions it needs (worktree setup, Linear issue fetch, PR creation). This avoids coupling the new skill to a risky refactor of the 2,450-line runner. Consolidation into shared lib/ files happens as a follow-up once both the autonomous runner and dispatch skill are stable and the shared interface is clear from actual usage.
+
+**When lib/ extraction happens:** Map functions to libraries based on actual usage patterns. Global variables in the runner will need to become function parameters or config reads. Test the extraction by running the full agent-runner test suite after each function is moved.
 
 ## Component 4: Linear CLI Integration
 
@@ -387,6 +426,8 @@ Add to `setup.sh` as an optional dependency check.
 | List by label | `linear issue list --label Agent` |
 | List children | `linear issue list --parent <ID>` |
 | Create child | `linear issue create --parent <ID> --team <T> --title "..."` |
+
+**Verification needed:** The `--parent`, `--label`, and `--status` flags above are target commands, not confirmed CLI features. Commands that `linear-cli` doesn't support yet fall back to the existing GraphQL wrapper. Verify each command against actual CLI help during implementation and document which ones need the fallback.
 
 ### Migration from Raw GraphQL
 
@@ -431,7 +472,7 @@ Extends the existing JSONL trace format with enforcement events:
 
 ### Self-Correction Detection
 
-When a `warn`-level rule fires on a file, the enforcement hook records the file + rule. On the next Edit/Write to the same file, the hook re-runs the rule. If it passes, emit a `self_corrected` event. This measures how effectively warnings drive agent behavior.
+When a `warn`-level rule fires on a file, the enforcement hook writes a `{file, rule, timestamp}` entry to `/tmp/enforce-pending-<session_id>.json` (session ID from `$CLAUDE_SESSION_ID` or fallback to PID-based). On the next Edit/Write to the same file, the post-hook re-runs the matching rule. If it passes, emit a `self_corrected` event and remove the entry. Pending entries are cleaned up when the session ends (or after a 4-hour TTL as a safety net).
 
 ### Nested Ticket Tracing
 
@@ -499,7 +540,6 @@ config/
 <project-root>/
   .claude/
     enforcement.yaml         # enforcement rules
-    enforcement.log          # info-level violation log
     patterns/                # markdown docs explaining each rule's rationale
       no-env-access.md
       service-boundary.md
@@ -526,18 +566,26 @@ config/
 6. **Tracing integration** — emit enforcement.* events to JSONL traces.
 7. **agent-harness init** — project bootstrapper.
 8. **agent-harness status** — metrics aggregation from traces.
-9. **lib/ extraction** — pull shared functions out of agent-runner.
-10. **skills/dispatch/** — interactive mode skill.
-11. **Linear CLI migration** — swap GraphQL calls for linear-cli incrementally.
+9. **skills/dispatch/** — interactive mode skill (duplicates needed functions initially).
+10. **Linear CLI migration** — swap GraphQL calls for linear-cli incrementally.
+11. **lib/ extraction** — consolidate shared functions once dispatch and runner interfaces stabilize.
 12. **Self-correction detection** — track warn → fix patterns.
 13. **Viewer updates** — enforcement events in trace viewer.
 
 ## Open Questions
 
 1. **Biome plugin authoring:** For projects that need custom AST rules beyond biome's built-in set, how much do we invest in authoring tooling? First iteration: only use rules biome already ships. Defer custom plugins.
-2. **LLM rule caching:** If the same file hasn't changed between edits, should we skip re-running LLM checks? Probably yes — cache by file content hash, invalidate on edit.
-3. **Rule dependencies:** Can one rule reference another? (e.g., "if no-raw-sql fires, also check for missing service layer") First iteration: no. Rules are independent.
-4. **Multi-language support:** enforcement.yaml rules with biome only work for JS/TS. Ruff for Python, clippy for Rust. Do we abstract the linter interface? First iteration: biome only. Add others as needed.
+2. **Rule dependencies:** Can one rule reference another? (e.g., "if no-raw-sql fires, also check for missing service layer") First iteration: no. Rules are independent.
+3. **Multi-language support:** enforcement.yaml rules with biome only work for JS/TS. Ruff for Python, clippy for Rust. Do we abstract the linter interface? First iteration: biome only. Add others as needed.
+
+## Resolved Decisions
+
+- **LLM rule caching:** Yes — cache by file content hash, skip re-check if unchanged. Specified in check types section.
+- **YAML parsing:** Use `yq -o json` conversion + `jq` queries, not shell variable caching.
+- **Config versioning:** `version: 1` is the only supported version. Unknown fields are ignored. Version bumps addressed when needed.
+- **Log file location:** `~/.config/claude-agents/logs/enforcement.log` (outside project tree).
+- **Baseline metrics:** v1 shows current rates only. "Before/after" comparisons deferred until baseline snapshot mechanism is designed.
+- **lib/ extraction:** Deferred. Dispatch duplicates needed functions initially; consolidation follows once shared interface is clear.
 
 ## References
 
