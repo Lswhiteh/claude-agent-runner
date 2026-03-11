@@ -1,0 +1,26 @@
+{
+  "cli_version": "0.4.9",
+  "checkpoint_id": "5f51cac6751a",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "docs/superpowers/specs/2026-03-11-agent-harness-framework-design.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/5f/51cac6751a/0/metadata.json",
+      "transcript": "/5f/51cac6751a/0/full.jsonl",
+      "context": "/5f/51cac6751a/0/context.md",
+      "content_hash": "/5f/51cac6751a/0/content_hash.txt",
+      "prompt": "/5f/51cac6751a/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 60,
+    "cache_creation_tokens": 73140,
+    "cache_read_tokens": 899209,
+    "output_tokens": 25872,
+    "api_call_count": 26
+  }
+}
