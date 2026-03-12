@@ -1,0 +1,29 @@
+how do we decide which linear workspace/team a pipeline will be parsed into
+
+---
+
+Cool. Can you generate a linear walkthrough of this codebase/project to show to others and describe the tool?
+
+---
+
+can I get a slideshow version
+
+---
+
+and I'm assuming we've got good docs on the readme and internal claudes?
+
+---
+
+all
+
+---
+
+Wondering how often docs should be updated, need to say not just "what" something is but "why"
+
+---
+
+Yeah I think that's great
+
+---
+
+push everything to main

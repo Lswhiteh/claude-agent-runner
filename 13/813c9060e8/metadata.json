@@ -1,0 +1,31 @@
+{
+  "cli_version": "0.4.9",
+  "checkpoint_id": "13813c9060e8",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 5,
+  "files_touched": [
+    "CLAUDE.md",
+    "README.md",
+    "bin/claude-agent-runner",
+    "docs/walkthrough-slides.html",
+    "docs/walkthrough.md",
+    "skills/agent-report/SKILL.md"
+  ],
+  "sessions": [
+    {
+      "metadata": "/13/813c9060e8/0/metadata.json",
+      "transcript": "/13/813c9060e8/0/full.jsonl",
+      "context": "/13/813c9060e8/0/context.md",
+      "content_hash": "/13/813c9060e8/0/content_hash.txt",
+      "prompt": "/13/813c9060e8/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 50,
+    "cache_creation_tokens": 76065,
+    "cache_read_tokens": 2326950,
+    "output_tokens": 29088,
+    "api_call_count": 34
+  }
+}
