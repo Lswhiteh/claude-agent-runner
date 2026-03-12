@@ -1,12 +1,12 @@
 #!/bin/bash
-# setup.sh — Install claude-agent-runner components
+# setup.sh — Install car (Claude Agent Runner) components
 # Usage: git clone https://github.com/Lswhiteh/claude-agent-runner.git && cd claude-agent-runner && ./setup.sh
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "Setting up claude-agent-runner from: $REPO_DIR"
+echo "Setting up car (Claude Agent Runner) from: $REPO_DIR"
 
 # --- bin/ → ~/.local/bin/ ---
 echo ""
@@ -172,7 +172,7 @@ mkdir -p "$HOME/.config/claude-agents/traces"
 SECRETS_FILE="$HOME/.config/claude-agents/secrets.env"
 if [ ! -f "$SECRETS_FILE" ]; then
   cat > "$SECRETS_FILE" << 'SECRETS'
-# Claude Agent Runner secrets — fill in your API keys
+# CAR (Claude Agent Runner) secrets — fill in your API keys
 # This file is sourced by the agent runner and cron jobs
 # Permissions: 600 (owner-only read/write)
 
@@ -191,7 +191,7 @@ echo ""
 echo "=== Done! ==="
 echo ""
 echo "What was set up:"
-echo "  ~/.local/bin/              ← claude-agent-runner, ci-gate"
+echo "  ~/.local/bin/              ← car, ci-gate, agent-trace"
 echo "  ~/.claude/hooks/           ← 11 hooks (guardrails, linting, budget, context, ...)"
 echo "  ~/.claude/skills/          ← agent skills (implement, orchestrate, scoped-worker, ...)"
 echo "  ~/.config/claude-agents/   ← config, secrets, logs, locks"
@@ -207,6 +207,6 @@ echo ""
 echo "  3. Optional: Install the cron job for autonomous agents:"
 echo "     crontab -l 2>/dev/null | cat - <<'CRON' | crontab -"
 echo "     PATH=/usr/local/bin:/usr/bin:/bin:\$HOME/.local/bin:/opt/homebrew/bin"
-echo "     */5 * * * * source \$HOME/.config/claude-agents/secrets.env && \$HOME/.local/bin/claude-agent-runner >> \$HOME/.config/claude-agents/cron.log 2>&1"
+echo "     */5 * * * * source \$HOME/.config/claude-agents/secrets.env && \$HOME/.local/bin/car >> \$HOME/.config/claude-agents/cron.log 2>&1"
 echo "     CRON"
 echo ""

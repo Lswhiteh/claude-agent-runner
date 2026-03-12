@@ -1,5 +1,5 @@
 #!/bin/bash
-# agent-trace — CLI tool for querying JSONL event traces from claude-agent-runner
+# agent-trace — CLI tool for querying JSONL event traces from car
 #
 # Usage:
 #   agent-trace list                    List all trace files with event counts and time range
@@ -20,7 +20,7 @@ VIEWER_HTML="$SCRIPT_DIR/agent-trace-viewer.html"
 
 usage() {
   cat <<'EOF'
-agent-trace — Query JSONL event traces from claude-agent-runner
+agent-trace — Query JSONL event traces from car
 
 Usage:
   agent-trace list                    List all trace files with event counts and time range

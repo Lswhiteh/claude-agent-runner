@@ -1,17 +1,17 @@
 #!/bin/bash
-# claude-agent-runner — Polls Linear for issues labeled "agent", spawns isolated Claude instances
+# car (Claude Agent Runner) — Polls Linear for issues labeled "agent", spawns isolated Claude instances
 #
 # Usage:
-#   claude-agent-runner                           Run for all configured workspaces/teams
-#   claude-agent-runner --auto-review             Run + auto-review PRs after creation
-#   claude-agent-runner --auto-fix                Run + auto-review + auto-fix loop
-#   claude-agent-runner --sequenced               Only pick up issues whose blockers are done
-#   claude-agent-runner --pipeline <file.md>      Parse requirements into Linear issues
-#   claude-agent-runner --spec <idea.md>          Generate spec from idea, optionally create issues
-#   claude-agent-runner --review-pr <num> --repo <path>  Standalone PR review
-#   claude-agent-runner --cleanup                 Clean up merged worktrees
-#   claude-agent-runner --status                  Show active agents and worktrees
-#   claude-agent-runner --help                    Show usage
+#   car                           Run for all configured workspaces/teams
+#   car --auto-review             Run + auto-review PRs after creation
+#   car --auto-fix                Run + auto-review + auto-fix loop
+#   car --sequenced               Only pick up issues whose blockers are done
+#   car --pipeline <file.md>      Parse requirements into Linear issues
+#   car --spec <idea.md>          Generate spec from idea, optionally create issues
+#   car --review-pr <num> --repo <path>  Standalone PR review
+#   car --cleanup                 Clean up merged worktrees
+#   car --status                  Show active agents and worktrees
+#   car --help                    Show usage
 #
 # Config: ~/.config/claude-agents/config.json
 # Logs:   ~/.config/claude-agents/logs/
@@ -633,7 +633,7 @@ cleanup_worktrees() {
 }
 
 show_status() {
-  echo "=== Claude Agent Runner Status ==="
+  echo "=== CAR Status ==="
   echo ""
 
   local WORKSPACES
@@ -764,7 +764,7 @@ ${NITS}
 ${PRAISE}
 
 ---
-_Automated review by claude-agent-runner_"
+_Automated review by car_"
 
     # Post review via gh
     case "$VERDICT" in
@@ -788,7 +788,7 @@ _Automated review by claude-agent-runner_"
 ${REVIEW_OUTPUT}
 
 ---
-_Automated review by claude-agent-runner_" 2>/dev/null
+_Automated review by car_" 2>/dev/null
     VERDICT="comment"
     log "[review] PR #${PR_NUMBER} commented (non-JSON output)"
   fi
@@ -2379,7 +2379,7 @@ case "${1:-}" in
       esac
     done
     if [ -z "$PIPELINE_FILE" ]; then
-      echo "Usage: claude-agent-runner --pipeline <requirements.md> [--workspace <name>] [--team <name>] [--dry-run]"
+      echo "Usage: car --pipeline <requirements.md> [--workspace <name>] [--team <name>] [--dry-run]"
       exit 1
     fi
     run_pipeline "$PIPELINE_FILE" "$PIPELINE_WS" "$PIPELINE_TEAM" "$PIPELINE_DRY_RUN"
@@ -2402,7 +2402,7 @@ case "${1:-}" in
       esac
     done
     if [ -z "$SPEC_FILE" ]; then
-      echo "Usage: claude-agent-runner --spec <idea.md> [--workspace <name>] [--team <name>] [--interactive] [--create]"
+      echo "Usage: car --spec <idea.md> [--workspace <name>] [--team <name>] [--interactive] [--create]"
       exit 1
     fi
     run_spec "$SPEC_FILE" "$SPEC_WS" "$SPEC_TEAM" "$SPEC_INTERACTIVE" "$SPEC_CREATE"
@@ -2419,7 +2419,7 @@ case "${1:-}" in
       esac
     done
     if [ -z "$REVIEW_PR_NUM" ] || [ -z "$REVIEW_REPO" ]; then
-      echo "Usage: claude-agent-runner --review-pr <number> --repo <path>"
+      echo "Usage: car --review-pr <number> --repo <path>"
       exit 1
     fi
     cd "$REVIEW_REPO" || { echo "ERROR: Repo not found: $REVIEW_REPO"; exit 1; }
@@ -2439,19 +2439,19 @@ case "${1:-}" in
     show_status
     ;;
   --help|-h)
-    echo "claude-agent-runner — Autonomous Claude agents from Linear issues"
+    echo "car (Claude Agent Runner) — Autonomous Claude agents from Linear issues"
     echo ""
     echo "Usage:"
-    echo "  claude-agent-runner                                   Poll all workspaces (default)"
-    echo "  claude-agent-runner --auto-review                     Poll + auto-review PRs"
-    echo "  claude-agent-runner --auto-fix                        Poll + auto-review + fix loop"
-    echo "  claude-agent-runner --sequenced                       Only pick up unblocked issues"
-    echo "  claude-agent-runner --pipeline <file.md> [options]    Parse requirements → Linear"
-    echo "  claude-agent-runner --spec <idea.md> [options]        Generate spec from idea"
-    echo "  claude-agent-runner --review-pr <num> --repo <path>   Standalone PR review"
-    echo "  claude-agent-runner --cleanup                         Clean up merged worktrees"
-    echo "  claude-agent-runner --status                          Show active agents"
-    echo "  claude-agent-runner --help                            Show this help"
+    echo "  car                                   Poll all workspaces (default)"
+    echo "  car --auto-review                     Poll + auto-review PRs"
+    echo "  car --auto-fix                        Poll + auto-review + fix loop"
+    echo "  car --sequenced                       Only pick up unblocked issues"
+    echo "  car --pipeline <file.md> [options]    Parse requirements → Linear"
+    echo "  car --spec <idea.md> [options]        Generate spec from idea"
+    echo "  car --review-pr <num> --repo <path>   Standalone PR review"
+    echo "  car --cleanup                         Clean up merged worktrees"
+    echo "  car --status                          Show active agents"
+    echo "  car --help                            Show this help"
     echo ""
     echo "Pipeline options:"
     echo "  --workspace <name>   Target workspace (default: first in config)"

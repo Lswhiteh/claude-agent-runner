@@ -1,4 +1,4 @@
-# claude-agent-runner: A Linear Walkthrough
+# car: A Linear Walkthrough
 
 > An autonomous Claude agent orchestrator that polls Linear for labeled issues, spawns isolated Claude instances in git worktrees, runs CI, and opens GitHub PRs — all unattended.
 
@@ -8,7 +8,7 @@
 
 ```
 ┌──────────┐      poll       ┌─────────────────────┐    spawn     ┌──────────────┐
-│  Linear   │ ◄──────────── │  claude-agent-runner │ ──────────► │  Claude CLI   │
+│  Linear   │ ◄──────────── │       car           │ ──────────► │  Claude CLI   │
 │  issues   │  GraphQL API   │  (bash orchestrator) │  per issue  │  (worktree)   │
 └──────────┘                └─────────────────────┘              └──────┬───────┘
                                 │         ▲                            │
@@ -42,7 +42,7 @@ cd claude-agent-runner
 
 `setup.sh` is idempotent — safe to re-run. It:
 
-1. **Symlinks scripts** (`bin/`) → `~/.local/bin/` — the main `claude-agent-runner` and `ci-gate` CLI tools
+1. **Symlinks scripts** (`bin/`) → `~/.local/bin/` — the main `car` and `ci-gate` CLI tools
 2. **Symlinks hooks** (`hooks/`) → `~/.claude/hooks/` — 11 Claude Code hooks for guardrails, and registers each in `~/.claude/settings.json` under the correct event/matcher
 3. **Symlinks skills** (`skills/`) → `~/.claude/skills/` — agent skills like `implement`, `orchestrate`, `debug`, etc.
 4. **Creates config** at `~/.config/claude-agents/config.json` from the example template
@@ -98,7 +98,7 @@ export SLACK_WEBHOOK_MYCOMPANY=https://hooks.slack.com/services/...
 The runner is designed to be invoked on a cron schedule (e.g., every 5 minutes):
 
 ```cron
-*/5 * * * * source ~/.config/claude-agents/secrets.env && claude-agent-runner >> ~/.config/claude-agents/cron.log 2>&1
+*/5 * * * * source ~/.config/claude-agents/secrets.env && car >> ~/.config/claude-agents/cron.log 2>&1
 ```
 
 Each invocation:
@@ -374,7 +374,7 @@ The `scope-guard.sh` hook reads the scope file and **blocks any file writes outs
 The `--pipeline` command turns a requirements markdown document into Linear issues with dependency relations.
 
 ```bash
-claude-agent-runner --pipeline requirements.md --workspace mycompany --team Engineering
+car --pipeline requirements.md --workspace mycompany --team Engineering
 ```
 
 Flow:
@@ -386,7 +386,7 @@ Flow:
 ### Dry run
 
 ```bash
-claude-agent-runner --pipeline requirements.md --dry-run
+car --pipeline requirements.md --dry-run
 ```
 
 Prints the parsed stories without creating anything — useful for validating the parse.
@@ -399,13 +399,13 @@ The `--spec` command generates structured requirements from a freeform idea:
 
 ```bash
 # Generate and print spec
-claude-agent-runner --spec idea.md --workspace mycompany --team Engineering
+car --spec idea.md --workspace mycompany --team Engineering
 
 # Interactive mode — ask Claude clarifying questions
-claude-agent-runner --spec idea.md --interactive
+car --spec idea.md --interactive
 
 # Generate spec AND create Linear issues in one shot
-claude-agent-runner --spec idea.md --create
+car --spec idea.md --create
 ```
 
 The spec generator reads the project's `CLAUDE.md` for context, so generated stories are aware of the codebase's conventions, stack, and architecture.
@@ -461,7 +461,7 @@ Real-time notifications at key lifecycle points: agent started, blocked, feedbac
 ### --status
 
 ```bash
-claude-agent-runner --status
+car --status
 ```
 
 Shows active agents, their PIDs, which issues they're working on, and pending issue counts per team.
@@ -472,13 +472,13 @@ Shows active agents, their PIDs, which issues they're working on, and pending is
 
 ```bash
 # Clean up worktrees for merged/closed PRs
-claude-agent-runner --cleanup
+car --cleanup
 
 # Standalone PR review (no agent run)
-claude-agent-runner --review-pr 42 --repo /path/to/repo
+car --review-pr 42 --repo /path/to/repo
 
 # Show help
-claude-agent-runner --help
+car --help
 ```
 
 ---
@@ -513,7 +513,7 @@ A typical autonomous workflow:
 1. Developer writes a Linear issue: "Add dark mode toggle to settings page"
 2. Developer adds the "Agent" label
 
-3. Cron fires → claude-agent-runner polls Linear → finds the issue
+3. Cron fires → car polls Linear → finds the issue
 4. Creates worktree at ~/.claude/worktrees/myapp/issue-ENG-456/
 5. Starts Postgres container on random port
 6. Spawns Claude with the issue description

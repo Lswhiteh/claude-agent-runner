@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>claude-agent-runner</title>
+<title>car</title>
 <style>
   :root {
     --bg: #0f1117;
@@ -264,7 +264,7 @@
 
 <!-- ======================================== SLIDE 1: TITLE ======================================== -->
 <div class="slide active" data-slide="0">
-  <h1>claude-agent-runner</h1>
+  <h1>car</h1>
   <p class="subtitle">Autonomous Claude agents that turn Linear issues into GitHub PRs</p>
   <hr>
   <p class="muted" style="margin-top:0.8em;">A ~2,500-line bash orchestrator with hooks, skills, tracing, and multi-agent coordination.</p>
@@ -365,7 +365,7 @@ cd claude-agent-runner
 <div class="slide" data-slide="4">
   <h2>The Polling Loop</h2>
   <pre><code><span class="cmt"># Cron fires every 5 minutes</span>
-*/5 * * * * source ~/.config/claude-agents/secrets.env && claude-agent-runner</code></pre>
+*/5 * * * * source ~/.config/claude-agents/secrets.env && car</code></pre>
   <div class="flow-steps" style="margin-top:1.5em;">
     <div class="flow-step"><div class="step-num">1</div><div class="step-text">Acquire per-repo lock (PID-based) to prevent overlapping runs</div></div>
     <div class="step-line"></div>
@@ -496,8 +496,8 @@ Closes ENG-123
       </div>
     </div>
   </div>
-  <pre style="margin-top:1em;"><code>claude-agent-runner <span class="flag">--auto-review</span>    <span class="cmt"># review only</span>
-claude-agent-runner <span class="flag">--auto-fix</span>       <span class="cmt"># review + fix loop</span></code></pre>
+  <pre style="margin-top:1em;"><code>car <span class="flag">--auto-review</span>    <span class="cmt"># review only</span>
+car <span class="flag">--auto-fix</span>       <span class="cmt"># review + fix loop</span></code></pre>
 </div>
 
 <!-- ======================================== SLIDE 10: FEEDBACK RESUME ======================================== -->
@@ -656,7 +656,7 @@ claude-agent-runner <span class="flag">--auto-fix</span>       <span class="cmt"
 <!-- ======================================== SLIDE 15: PIPELINE ======================================== -->
 <div class="slide" data-slide="14">
   <h2>Pipeline: Requirements &rarr; Linear Issues</h2>
-  <pre><code>claude-agent-runner <span class="flag">--pipeline</span> requirements.md <span class="flag">--workspace</span> myco <span class="flag">--team</span> Engineering</code></pre>
+  <pre><code>car <span class="flag">--pipeline</span> requirements.md <span class="flag">--workspace</span> myco <span class="flag">--team</span> Engineering</code></pre>
   <div class="flow-steps" style="margin:1.2em 0;">
     <div class="flow-step"><div class="step-num">1</div><div class="step-text">Claude parses markdown into structured JSON (title, description, estimate, labels, dependencies)</div></div>
     <div class="step-line"></div>
@@ -667,20 +667,20 @@ claude-agent-runner <span class="flag">--auto-fix</span>       <span class="cmt"
     <div class="flow-step"><div class="step-num">4</div><div class="step-text">With <code class="flag">--sequenced</code>: dependent stories wait for blockers before getting labeled</div></div>
   </div>
   <pre><code><span class="cmt"># Preview without creating</span>
-claude-agent-runner <span class="flag">--pipeline</span> requirements.md <span class="flag">--dry-run</span></code></pre>
+car <span class="flag">--pipeline</span> requirements.md <span class="flag">--dry-run</span></code></pre>
 </div>
 
 <!-- ======================================== SLIDE 16: SPEC ======================================== -->
 <div class="slide" data-slide="15">
   <h2>Spec Generation: Idea &rarr; Requirements</h2>
   <pre><code><span class="cmt"># Generate a spec from a freeform idea</span>
-claude-agent-runner <span class="flag">--spec</span> idea.md
+car <span class="flag">--spec</span> idea.md
 
 <span class="cmt"># Interactive: ask Claude clarifying questions</span>
-claude-agent-runner <span class="flag">--spec</span> idea.md <span class="flag">--interactive</span>
+car <span class="flag">--spec</span> idea.md <span class="flag">--interactive</span>
 
 <span class="cmt"># Generate spec AND create Linear issues in one shot</span>
-claude-agent-runner <span class="flag">--spec</span> idea.md <span class="flag">--create</span></code></pre>
+car <span class="flag">--spec</span> idea.md <span class="flag">--create</span></code></pre>
   <div class="diagram" style="margin:1.5em 0;">
     <div class="box accent-border">
       <div class="muted" style="font-size:0.8em;">idea.md</div>
@@ -735,7 +735,7 @@ agent-trace view          <span class="cmt"># browser viewer</span></code></pre>
         <tr><td>Linear</td><td>Status comments on the issue</td></tr>
       </table>
       <pre style="font-size:0.85em;margin-top:1em;"><code><span class="cmt"># Quick status check</span>
-claude-agent-runner <span class="flag">--status</span></code></pre>
+car <span class="flag">--status</span></code></pre>
       <p class="muted" style="font-size:0.9em;">Shows active agents, PIDs, issues, and pending counts.</p>
     </div>
   </div>

@@ -1,4 +1,4 @@
-# claude-agent-runner
+# car (Claude Agent Runner)
 
 Autonomous Claude Code agent orchestrator. Polls Linear for labeled issues, spawns isolated Claude instances in git worktrees, runs CI gates, and opens GitHub PRs — fully hands-off.
 
@@ -32,40 +32,40 @@ cd claude-agent-runner
 Then:
 1. Edit `~/.config/claude-agents/secrets.env` with your API keys
 2. Edit `~/.config/claude-agents/config.json` with your repos
-3. Label a Linear issue with "Agent" and run `claude-agent-runner`
+3. Label a Linear issue with "Agent" and run `car`
 
 ## Usage
 
 ```bash
 # Poll all workspaces (default)
-claude-agent-runner
+car
 
 # Poll with auto-review of created PRs
-claude-agent-runner --auto-review
+car --auto-review
 
 # Poll with auto-review + auto-fix loop
-claude-agent-runner --auto-fix
+car --auto-fix
 
 # Only pick up issues with completed blockers
-claude-agent-runner --sequenced
+car --sequenced
 
 # Parse requirements into Linear issues
-claude-agent-runner --pipeline requirements.md --workspace myapp --team Engineering
-claude-agent-runner --pipeline requirements.md --dry-run
+car --pipeline requirements.md --workspace myapp --team Engineering
+car --pipeline requirements.md --dry-run
 
 # Generate spec from an idea, optionally create Linear issues
-claude-agent-runner --spec idea.md
-claude-agent-runner --spec idea.md --interactive
-claude-agent-runner --spec idea.md --create
+car --spec idea.md
+car --spec idea.md --interactive
+car --spec idea.md --create
 
 # Standalone PR review
-claude-agent-runner --review-pr 42 --repo /path/to/repo
+car --review-pr 42 --repo /path/to/repo
 
 # Clean up merged worktrees
-claude-agent-runner --cleanup
+car --cleanup
 
 # Show active agents and pending issues
-claude-agent-runner --status
+car --status
 
 # Query event traces
 agent-trace list                    # List all traces
@@ -188,13 +188,13 @@ Turn ideas into actionable Linear issues:
 
 ```bash
 # Generate structured requirements from a free-form idea
-claude-agent-runner --spec idea.md
+car --spec idea.md
 
 # Interactive mode — Claude asks clarifying questions
-claude-agent-runner --spec idea.md --interactive
+car --spec idea.md --interactive
 
 # Generate and create Linear issues in one step
-claude-agent-runner --spec idea.md --create
+car --spec idea.md --create
 ```
 
 ### Feedback Resume
@@ -233,7 +233,7 @@ The timeline viewer is a single-file HTML app (no build step) with color-coded e
 ### Status
 
 ```bash
-claude-agent-runner --status
+car --status
 ```
 
 Shows all configured workspaces/teams, active agents with PIDs and issue IDs, and pending issue counts per team.

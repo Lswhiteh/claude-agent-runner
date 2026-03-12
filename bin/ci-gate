@@ -1,6 +1,6 @@
 #!/bin/bash
 # ci-gate — Deterministic CI checks that MUST pass before push/PR
-# Called by claude-agent-runner before opening PRs.
+# Called by car before opening PRs.
 # Also usable standalone: ci-gate [repo-path]
 #
 # Exit 0 = all checks pass, safe to push

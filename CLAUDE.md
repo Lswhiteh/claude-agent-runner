@@ -1,4 +1,4 @@
-# claude-agent-runner
+# car (Claude Agent Runner)
 
 Autonomous Claude agent orchestrator that polls Linear for labeled issues, spawns isolated Claude instances in git worktrees, runs CI, and opens GitHub PRs.
 
@@ -6,7 +6,7 @@ Autonomous Claude agent orchestrator that polls Linear for labeled issues, spawn
 
 ```
 bin/
-  claude-agent-runner       Main orchestrator script
+  car                       Main orchestrator script (Claude Agent Runner)
   ci-gate                   Deterministic CI checks before push
   agent-trace               CLI for querying JSONL event traces (list, show, tail, view)
   agent-trace-viewer.html   Single-file HTML viewer for trace timelines
@@ -47,7 +47,7 @@ setup.sh                    One-command install: symlinks, hooks, skills, config
 
 ## Key Architecture
 
-### Agent Runner (~2450 lines bash)
+### car (~2450 lines bash)
 - **Polling**: Fetches Linear issues labeled with configurable label (default: "Agent")
 - **Worktrees**: Creates isolated worktrees at `~/.claude/worktrees/<repo>/issue-<ID>/`
 - **Branches**: Named `agent/<IDENTIFIER>` (e.g., `agent/ENG-123`)
