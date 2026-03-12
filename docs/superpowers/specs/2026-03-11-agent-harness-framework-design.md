@@ -142,6 +142,14 @@ Three tiers, escalate only when needed:
 - Cost: ~$0.0004 per check (1K tokens in, 100 tokens out)
 - Caches results by file content hash — skips re-check if file unchanged since last evaluation
 
+**4. Browser (agent-browser)**
+- E2E and UI validation via headless browser automation
+- Good for: component rendering verification, visual regression, browser error detection, accessibility checks
+- CLI-based (`agent-browser navigate`, `agent-browser snapshot`, `agent-browser screenshot`)
+- Returns AI-optimized accessibility tree snapshots instead of raw DOM
+- Runs in post hook only (async) — requires running dev server
+- Use for UI-touching changes: components, pages, styles
+
 ### Enforcement Levels
 
 **`block`** — Hook exits non-zero (code 2). Action is denied. Agent sees the error message and must self-correct before proceeding. Only for deterministic checks (grep, biome) — never LLM, since nondeterministic blocks would be frustrating.
@@ -196,7 +204,7 @@ rules:
 
   - name: <identifier>               # unique, kebab-case
     description: "<why this rule exists>"
-    check: grep | biome | llm
+    check: grep | biome | llm | browser
     level: block | warn | info
 
     # For grep checks:
@@ -208,6 +216,16 @@ rules:
     # For llm checks:
     prompt: |
       <prompt text sent to Haiku along with the file diff>
+
+    # For browser checks:
+    url: "http://localhost:3000/page"    # URL to check
+    assertions:                          # what to verify
+      - type: snapshot                   # accessibility tree check
+        prompt: "Does the page render correctly with the new component?"
+      - type: screenshot                 # visual check
+        baseline: ".claude/baselines/page.png"
+      - type: console                    # check for browser errors
+        level: error                     # error | warn
 
     # File targeting (all check types):
     files: "glob/pattern/**/*.ts"    # which files this rule applies to
@@ -672,6 +690,7 @@ config/
 - **yq** — YAML parsing in bash (single binary, `brew install yq`)
 - **linear-cli** — Linear API access (`brew install schpet/tap/linear`)
 - **biome** (optional) — AST-level enforcement, only if project uses it
+- **agent-browser** — Browser automation CLI for E2E/UI validation (`npm install -g agent-browser && agent-browser install`, or `brew install agent-browser`). [vercel-labs/agent-browser](https://github.com/vercel-labs/agent-browser). CLI-first, AI-optimized (accessibility tree snapshots, semantic locators), Rust-fast. Preferred over raw Playwright or Playwright MCP — zero schema injection cost, returns only what's requested.
 - **Anthropic API key** — for LLM-judged rules (Haiku). Set via env var referenced in config.
 
 ## Implementation Order
