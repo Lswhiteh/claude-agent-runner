@@ -19,6 +19,7 @@ Autonomous Claude Code agent orchestrator. Polls Linear for labeled issues, spaw
 - **Guardrails**: Hooks block destructive commands and enforce file scope in agent mode
 - **Multi-workspace**: Support multiple Linear workspaces and teams
 - **Slack notifications**: Optional webhook notifications at key lifecycle points
+- **Event tracing**: JSONL traces per issue with CLI viewer and browser timeline
 
 ## Quick Start
 
@@ -65,6 +66,12 @@ claude-agent-runner --cleanup
 
 # Show active agents and pending issues
 claude-agent-runner --status
+
+# Query event traces
+agent-trace list                    # List all traces
+agent-trace show ENG-123            # Pretty-print a trace
+agent-trace tail ENG-123            # Live-tail events
+agent-trace view                    # Open browser timeline viewer
 ```
 
 ## Configuration
@@ -207,6 +214,34 @@ If the agent can't proceed:
 2. Runner posts questions to Linear
 3. Developer replies on Linear
 4. Re-add "Agent" label → agent resumes with answers
+
+### Event Tracing
+
+Every issue run emits structured JSONL events (~30 event types across 7 categories) to `~/.config/claude-agents/traces/`.
+
+```bash
+# CLI tool
+agent-trace list                    # List all traces
+agent-trace show ENG-123            # Pretty-print events for an issue
+agent-trace tail ENG-123            # Live-tail (like tail -f)
+agent-trace view                    # Open browser timeline viewer
+agent-trace view ENG-123            # Open viewer filtered to one trace
+```
+
+The timeline viewer is a single-file HTML app (no build step) with color-coded events, filter chips, search, auto-refresh, and swimlane view for orchestrated issues.
+
+### Status
+
+```bash
+claude-agent-runner --status
+```
+
+Shows all configured workspaces/teams, active agents with PIDs and issue IDs, and pending issue counts per team.
+
+## Documentation
+
+- [Walkthrough](docs/walkthrough.md) — linear narrative of the full system
+- [Slide deck](docs/walkthrough-slides.html) — 20-slide HTML presentation (open in browser)
 
 ## Requirements
 

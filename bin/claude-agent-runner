@@ -2011,40 +2011,58 @@ AND the blocked file together.
 **Description:**
 ${DESCRIPTION}
 
-## Documentation Requirements (MANDATORY)
-After implementation, you MUST update project documentation:
+## Documentation Requirements
 
-1. **CHANGELOG or relevant docs**: If the project has a CHANGELOG.md, docs/ directory,
-   or similar, add an entry describing what was implemented and any decisions made.
+Update docs when a future agent or human would make a wrong decision without
+context that isn't visible in the code. Don't document for the sake of documenting.
 
-2. **Architecture/schema docs**: If you changed database schema, API contracts, or
-   component architecture, update the corresponding docs (e.g., docs/database/schema/,
-   API docs, component docs).
+**The rule: docs must answer \"why\", not restate \"what\".** Code already shows what.
+Git blame shows when and who. Only docs can capture why this approach was chosen,
+what breaks if you change it, and what external factor drove the decision.
 
-3. **CLAUDE.md**: If you discovered a new convention, gotcha, or hard-won rule during
-   implementation, add it to the project's CLAUDE.md so future agents benefit.
+### When to update docs (and when not to)
 
-4. **Implementation summary**: Create a file at \`.claude/agent-reports/${IDENTIFIER}.md\`
-   with this structure:
+- **New feature or component**: YES — why it exists, what alternatives were rejected
+- **Architecture or schema change**: YES — why the old shape was wrong, what the new shape enables
+- **Convention or gotcha discovered**: YES — add to CLAUDE.md so future agents don't repeat mistakes
+- **Bug fix**: ONLY if the bug revealed a non-obvious constraint (\"X breaks if Y because Z\")
+- **Trivial fix** (typo, formatting, small refactor): NO — don't create noise
+
+### What to update
+
+1. **CLAUDE.md**: When you discover a convention, constraint, or gotcha that isn't
+   obvious from reading the code. Frame it as: what the rule is, why it exists,
+   and what goes wrong without it.
+
+2. **Architecture/schema docs**: When you change database schema, API contracts, or
+   component architecture. Explain why the change was needed, not just what changed.
+
+3. **CHANGELOG or relevant docs**: If the project has one and the change is user-facing.
+
+### Implementation report (MANDATORY)
+
+Create \`.claude/agent-reports/${IDENTIFIER}.md\` — this gets posted to Linear for review:
 
    # ${IDENTIFIER}: ${TITLE}
 
-   ## What was implemented
-   [Brief summary of changes]
+   ## Summary
+   [1-3 sentences: what changed and WHY — what problem does this solve?]
+
+   ## Decisions and rationale
+   [For each non-obvious decision: what you chose, what you considered, why.
+   This is the most important section — it captures context that the diff cannot.]
 
    ## Files changed
-   [List of files and what changed in each]
-
-   ## Decisions made
-   [Any architectural or implementation decisions and why]
+   [List of files. For each, say WHY it was changed, not what the diff shows.]
 
    ## Risks or follow-ups
-   [Anything that needs human attention or future work]
+   [What needs human attention. What edge cases weren't covered and why.
+   What trade-offs were made. Be honest — hidden problems are worse than known ones.]
 
    ## Tests
-   [What was tested and coverage notes]
+   [What was tested, what coverage looks like, what ISN'T tested and why.]
 
-Commit all documentation updates as part of your work.
+Commit documentation updates as part of your work.
 
 Do NOT modify files outside this worktree." --max-turns 500
         trace_event "agent.finished" "mode=standard"

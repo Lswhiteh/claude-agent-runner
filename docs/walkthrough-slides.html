@@ -1,0 +1,874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>claude-agent-runner</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2a2d3a;
+    --text: #e1e4ed;
+    --muted: #8b90a0;
+    --accent: #7c6aef;
+    --accent-dim: #5b4bbf;
+    --green: #3dd68c;
+    --orange: #f0a050;
+    --red: #ef6b6b;
+    --blue: #5ba8f0;
+    --cyan: #4dd4c0;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+  }
+
+  /* --- Slide container --- */
+  .deck { position: relative; width: 100%; height: 100%; }
+
+  .slide {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 6vh 8vw;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.35s ease;
+  }
+  .slide.active { opacity: 1; pointer-events: auto; }
+
+  /* --- Typography --- */
+  h1 { font-size: clamp(2rem, 5vw, 3.8rem); font-weight: 700; letter-spacing: -0.02em; line-height: 1.15; margin-bottom: 0.4em; }
+  h2 { font-size: clamp(1.6rem, 3.5vw, 2.6rem); font-weight: 600; letter-spacing: -0.01em; line-height: 1.2; margin-bottom: 0.5em; }
+  h3 { font-size: clamp(1.1rem, 2vw, 1.5rem); font-weight: 600; margin-bottom: 0.4em; color: var(--accent); }
+  p, li { font-size: clamp(1rem, 1.8vw, 1.35rem); line-height: 1.6; color: var(--text); }
+  .muted { color: var(--muted); }
+  .accent { color: var(--accent); }
+  .green { color: var(--green); }
+  .orange { color: var(--orange); }
+  .red { color: var(--red); }
+  .blue { color: var(--blue); }
+  .cyan { color: var(--cyan); }
+
+  ul { list-style: none; padding: 0; }
+  ul li { padding: 0.3em 0; padding-left: 1.6em; position: relative; }
+  ul li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0.65em;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+
+  /* --- Code blocks --- */
+  pre {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.2em 1.5em;
+    overflow-x: auto;
+    margin: 0.8em 0;
+    font-size: clamp(0.8rem, 1.4vw, 1.05rem);
+    line-height: 1.55;
+  }
+  code {
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    color: var(--cyan);
+  }
+  pre code { color: var(--text); }
+  .kw { color: var(--accent); }
+  .str { color: var(--green); }
+  .cmt { color: var(--muted); }
+  .flag { color: var(--orange); }
+  .val { color: var(--cyan); }
+
+  /* --- Diagram boxes --- */
+  .diagram {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1.2em;
+    flex-wrap: wrap;
+    margin: 1.5em 0;
+    font-size: clamp(0.85rem, 1.5vw, 1.1rem);
+  }
+  .box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1em 1.5em;
+    text-align: center;
+    min-width: 120px;
+  }
+  .box.accent-border { border-color: var(--accent); }
+  .box.green-border { border-color: var(--green); }
+  .box.orange-border { border-color: var(--orange); }
+  .box.blue-border { border-color: var(--blue); }
+  .arrow { font-size: 1.6em; color: var(--muted); }
+  .arrow-down { transform: rotate(90deg); }
+
+  /* --- Grid layout --- */
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2.5em;
+    align-items: start;
+  }
+  .three-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 1.5em;
+    align-items: start;
+  }
+
+  /* --- Table --- */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.8em 0;
+    font-size: clamp(0.8rem, 1.3vw, 1rem);
+  }
+  th, td {
+    padding: 0.55em 0.8em;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  th { color: var(--muted); font-weight: 500; font-size: 0.9em; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  /* --- Stepped flow --- */
+  .flow-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5em;
+    margin: 1em 0;
+  }
+  .flow-step {
+    display: flex;
+    align-items: center;
+    gap: 1em;
+  }
+  .step-num {
+    flex-shrink: 0;
+    width: 2em;
+    height: 2em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: var(--accent-dim);
+    color: white;
+    font-weight: 700;
+    font-size: 0.9em;
+  }
+  .step-line {
+    flex-shrink: 0;
+    width: 2px;
+    height: 0.6em;
+    background: var(--border);
+    margin-left: calc(1em - 1px);
+  }
+  .step-text { font-size: clamp(0.9rem, 1.5vw, 1.15rem); }
+
+  /* --- Tag pills --- */
+  .tag {
+    display: inline-block;
+    padding: 0.15em 0.6em;
+    border-radius: 6px;
+    font-size: 0.85em;
+    font-weight: 500;
+    background: var(--surface);
+    border: 1px solid var(--border);
+  }
+  .tag.purple { border-color: var(--accent); color: var(--accent); }
+  .tag.green { border-color: var(--green); color: var(--green); }
+  .tag.orange { border-color: var(--orange); color: var(--orange); }
+  .tag.red { border-color: var(--red); color: var(--red); }
+  .tag.blue { border-color: var(--blue); color: var(--blue); }
+
+  /* --- Progress bar (bottom) --- */
+  .progress {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    height: 3px;
+    background: var(--accent);
+    transition: width 0.35s ease;
+    z-index: 100;
+  }
+
+  /* --- Slide counter --- */
+  .counter {
+    position: fixed;
+    bottom: 1em;
+    right: 1.5em;
+    font-size: 0.85rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    z-index: 100;
+  }
+
+  /* --- Nav hint --- */
+  .nav-hint {
+    position: fixed;
+    bottom: 1em;
+    left: 1.5em;
+    font-size: 0.75rem;
+    color: var(--border);
+    z-index: 100;
+  }
+
+  /* --- Subtitle line --- */
+  .subtitle {
+    font-size: clamp(1rem, 2vw, 1.5rem);
+    color: var(--muted);
+    margin-bottom: 1em;
+  }
+
+  /* --- Separator --- */
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 1em 0;
+  }
+
+  /* --- Phase card --- */
+  .phase-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.2em 1.5em;
+    margin-bottom: 0.8em;
+  }
+  .phase-card h3 { margin-bottom: 0.2em; }
+
+  /* vertically centered with top bias */
+  .slide.top-align { justify-content: flex-start; padding-top: 8vh; }
+</style>
+</head>
+<body>
+
+<div class="deck" id="deck">
+
+<!-- ======================================== SLIDE 1: TITLE ======================================== -->
+<div class="slide active" data-slide="0">
+  <h1>claude-agent-runner</h1>
+  <p class="subtitle">Autonomous Claude agents that turn Linear issues into GitHub PRs</p>
+  <hr>
+  <p class="muted" style="margin-top:0.8em;">A ~2,500-line bash orchestrator with hooks, skills, tracing, and multi-agent coordination.</p>
+</div>
+
+<!-- ======================================== SLIDE 2: WHAT IT DOES ======================================== -->
+<div class="slide" data-slide="1">
+  <h2>What does it do?</h2>
+  <div class="diagram" style="margin:1.5em 0;">
+    <div class="box accent-border">
+      <div class="muted" style="font-size:0.8em;">Linear</div>
+      <div>Labeled issue</div>
+    </div>
+    <div class="arrow">&rarr;</div>
+    <div class="box" style="border-color:var(--cyan);">
+      <div class="muted" style="font-size:0.8em;">agent-runner</div>
+      <div>Orchestrate</div>
+    </div>
+    <div class="arrow">&rarr;</div>
+    <div class="box green-border">
+      <div class="muted" style="font-size:0.8em;">Claude CLI</div>
+      <div>Implement</div>
+    </div>
+    <div class="arrow">&rarr;</div>
+    <div class="box orange-border">
+      <div class="muted" style="font-size:0.8em;">CI gate</div>
+      <div>Validate</div>
+    </div>
+    <div class="arrow">&rarr;</div>
+    <div class="box blue-border">
+      <div class="muted" style="font-size:0.8em;">GitHub</div>
+      <div>Draft PR</div>
+    </div>
+  </div>
+  <ul style="margin-top:1em;">
+    <li>Polls Linear on a cron schedule (e.g., every 5 minutes)</li>
+    <li>Each issue gets an <strong>isolated git worktree</strong> + optional Docker DB</li>
+    <li>Claude runs autonomously with guardrail hooks</li>
+    <li>CI gate validates; retry loop auto-fixes failures</li>
+    <li>Creates draft PR, posts report to Linear, notifies Slack</li>
+  </ul>
+</div>
+
+<!-- ======================================== SLIDE 3: SETUP ======================================== -->
+<div class="slide" data-slide="2">
+  <h2>Setup</h2>
+  <pre><code>git clone https://github.com/Lswhiteh/claude-agent-runner.git
+cd claude-agent-runner
+./setup.sh</code></pre>
+  <p style="margin:0.8em 0 1.2em;"><code>setup.sh</code> is idempotent &mdash; symlinks everything and registers hooks:</p>
+  <div class="two-col">
+    <div>
+      <h3>What gets installed</h3>
+      <ul>
+        <li><code>~/.local/bin/</code> &mdash; CLI tools</li>
+        <li><code>~/.claude/hooks/</code> &mdash; 11 guardrail hooks</li>
+        <li><code>~/.claude/skills/</code> &mdash; agent skill prompts</li>
+        <li><code>~/.config/claude-agents/</code> &mdash; config, secrets, logs</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Manual steps</h3>
+      <ul>
+        <li>Fill in API keys in <code>secrets.env</code></li>
+        <li>Edit <code>config.json</code> with repo paths</li>
+        <li>Optional: install the cron job</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ======================================== SLIDE 4: CONFIG ======================================== -->
+<div class="slide" data-slide="3">
+  <h2>Configuration</h2>
+  <pre><code><span class="cmt">// ~/.config/claude-agents/config.json</span>
+{
+  <span class="str">"label"</span>: <span class="str">"Agent"</span>,          <span class="cmt">// Linear label that triggers pickup</span>
+  <span class="str">"max_parallel"</span>: <span class="val">3</span>,           <span class="cmt">// concurrent agents per team</span>
+  <span class="str">"max_ci_retries"</span>: <span class="val">3</span>,         <span class="cmt">// CI fail &rarr; fix &rarr; retry attempts</span>
+  <span class="str">"orchestrator"</span>: {
+    <span class="str">"enabled"</span>: <span class="val">true</span>,
+    <span class="str">"label"</span>: <span class="str">"Orchestrate"</span>,   <span class="cmt">// triggers multi-agent decomposition</span>
+    <span class="str">"max_subtasks"</span>: <span class="val">8</span>
+  },
+  <span class="str">"workspaces"</span>: {
+    <span class="str">"mycompany"</span>: {
+      <span class="str">"api_key_env"</span>: <span class="str">"LINEAR_API_KEY_MYCO"</span>,
+      <span class="str">"teams"</span>: {
+        <span class="str">"Engineering"</span>: { <span class="str">"repo"</span>: <span class="str">"/path/to/repo"</span>, <span class="str">"local_db"</span>: <span class="str">"postgres"</span> }
+      }
+    }
+  }
+}</code></pre>
+  <p class="muted" style="margin-top:0.6em;">Workspaces = Linear orgs. Each team maps to a local git repo.</p>
+</div>
+
+<!-- ======================================== SLIDE 5: POLLING ======================================== -->
+<div class="slide" data-slide="4">
+  <h2>The Polling Loop</h2>
+  <pre><code><span class="cmt"># Cron fires every 5 minutes</span>
+*/5 * * * * source ~/.config/claude-agents/secrets.env && claude-agent-runner</code></pre>
+  <div class="flow-steps" style="margin-top:1.5em;">
+    <div class="flow-step"><div class="step-num">1</div><div class="step-text">Acquire per-repo lock (PID-based) to prevent overlapping runs</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num">2</div><div class="step-text">Clean up worktrees for merged/closed PRs</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num">3</div><div class="step-text">Count available slots: <code>max_parallel</code> &minus; active agents (by PID)</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num">4</div><div class="step-text">Fetch labeled issues via Linear GraphQL (up to available slots)</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num">5</div><div class="step-text">Spawn a background subprocess for each issue</div></div>
+  </div>
+  <p class="muted" style="margin-top:1em;">The runner is stateless &mdash; all state lives in worktrees, Linear, GitHub, and trace files.</p>
+</div>
+
+<!-- ======================================== SLIDE 6: ISSUE LIFECYCLE ======================================== -->
+<div class="slide top-align" data-slide="5">
+  <h2>Issue Lifecycle</h2>
+  <p class="subtitle">What happens when a new issue is picked up</p>
+  <div class="two-col" style="margin-top:1em;">
+    <div>
+      <h3>1. Worktree &amp; environment</h3>
+      <ul>
+        <li><code>git worktree add</code> from <code>origin/main</code></li>
+        <li>Branch: <code>agent/ENG-123-title-slug</code></li>
+        <li>Copies <code>.env</code> files from repo root</li>
+        <li>Optionally starts Docker DB container</li>
+      </ul>
+      <h3 style="margin-top:1em;">2. Linear update</h3>
+      <ul>
+        <li>State &rarr; <span class="tag blue">In Progress</span></li>
+        <li>Remove <span class="tag purple">Agent</span> label (prevents re-pickup)</li>
+      </ul>
+    </div>
+    <div>
+      <h3>3. Claude invocation</h3>
+      <pre style="font-size:0.85em;"><code><span class="kw">export</span> CLAUDE_AGENT_MODE=<span class="val">1</span>
+<span class="kw">export</span> CLAUDE_AGENT_ISSUE_ID=<span class="str">"ENG-123"</span>
+
+claude <span class="flag">--permission-mode</span> bypassPermissions \
+  <span class="flag">-p</span> <span class="str">"You are working on ENG-123..."</span> \
+  <span class="flag">--max-turns</span> <span class="val">500</span></code></pre>
+      <p class="muted" style="font-size:0.9em;">Claude reads CLAUDE.md, explores the codebase, writes tests, implements, commits.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ======================================== SLIDE 7: CI GATE ======================================== -->
+<div class="slide" data-slide="6">
+  <h2>CI Gate &amp; Retry Loop</h2>
+  <p style="margin-bottom:1em;">After Claude exits, the runner validates the work:</p>
+  <div class="two-col">
+    <div>
+      <h3>ci-gate auto-detects project type</h3>
+      <table>
+        <tr><th>Stack</th><th>Checks</th></tr>
+        <tr><td>TypeScript / Next.js</td><td><code>tsc</code>, vitest/jest, <code>next build</code></td></tr>
+        <tr><td>Rust</td><td><code>cargo check</code>, test, build</td></tr>
+        <tr><td>Python</td><td><code>pytest</code></td></tr>
+        <tr><td>Go</td><td><code>go vet</code>, test, build</td></tr>
+      </table>
+      <p class="muted" style="margin-top:0.6em;font-size:0.9em;">Or use a <code>.ci-gate</code> file for custom commands.</p>
+    </div>
+    <div>
+      <h3>Retry on failure</h3>
+      <div class="flow-steps">
+        <div class="flow-step"><div class="step-num" style="background:var(--red);">!</div><div class="step-text">CI fails &rarr; extract error output</div></div>
+        <div class="step-line"></div>
+        <div class="flow-step"><div class="step-num">2</div><div class="step-text">Spawn Claude with errors, ask it to fix</div></div>
+        <div class="step-line"></div>
+        <div class="flow-step"><div class="step-num">3</div><div class="step-text">Re-run CI gate</div></div>
+        <div class="step-line"></div>
+        <div class="flow-step"><div class="step-num">4</div><div class="step-text">Up to <code>max_ci_retries</code> (default 3)</div></div>
+      </div>
+      <p class="muted" style="margin-top:0.6em;font-size:0.9em;">All retries exhausted &rarr; failure report posted to Linear + Slack.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ======================================== SLIDE 8: PR CREATION ======================================== -->
+<div class="slide" data-slide="7">
+  <h2>Push &amp; PR</h2>
+  <p>Once CI passes:</p>
+  <div class="flow-steps" style="margin:1.2em 0;">
+    <div class="flow-step"><div class="step-num" style="background:var(--green);">1</div><div class="step-text"><code>git push -u origin agent/ENG-123-add-auth</code></div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num" style="background:var(--green);">2</div><div class="step-text"><code>gh pr create --draft</code> with implementation report as body</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num" style="background:var(--green);">3</div><div class="step-text">Linear state &rarr; <span class="tag blue">In Review</span>, post PR link as comment</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num" style="background:var(--green);">4</div><div class="step-text">Slack notification</div></div>
+  </div>
+  <pre style="margin-top:1em;"><code><span class="cmt"># PR title</span>
+ENG-123: Add user authentication
+
+<span class="cmt"># PR body = agent's implementation report (.claude/agent-reports/ENG-123.md)</span>
+<span class="cmt"># Footer</span>
+Closes ENG-123
+<span class="muted">Implemented by autonomous Claude agent. CI gate passed: type-check, tests, build.</span></code></pre>
+</div>
+
+<!-- ======================================== SLIDE 9: AUTO REVIEW ======================================== -->
+<div class="slide" data-slide="8">
+  <h2>Auto-Review &amp; Auto-Fix</h2>
+  <div class="two-col">
+    <div>
+      <h3>Auto-Review</h3>
+      <p>A <strong>read-only</strong> Claude instance (<code>--permission-mode plan</code>) reviews the diff and outputs structured JSON:</p>
+      <pre style="font-size:0.85em;margin-top:0.6em;"><code>{
+  <span class="str">"verdict"</span>: <span class="str">"request_changes"</span>,
+  <span class="str">"blocking"</span>: [<span class="str">"Missing input validation"</span>],
+  <span class="str">"important"</span>: [<span class="str">"Add aria-label"</span>],
+  <span class="str">"nits"</span>: [...],
+  <span class="str">"praise"</span>: [...]
+}</code></pre>
+      <p class="muted" style="margin-top:0.5em;font-size:0.9em;">Posted via <code>gh pr review</code> with the matching verdict.</p>
+    </div>
+    <div>
+      <h3>Auto-Fix Loop</h3>
+      <p>If verdict = <span class="tag red">request_changes</span>:</p>
+      <div class="flow-steps" style="margin-top:0.6em;">
+        <div class="flow-step"><div class="step-num">1</div><div class="step-text">Gather all PR feedback</div></div>
+        <div class="step-line"></div>
+        <div class="flow-step"><div class="step-num">2</div><div class="step-text">Spawn Claude to address feedback</div></div>
+        <div class="step-line"></div>
+        <div class="flow-step"><div class="step-num">3</div><div class="step-text">Run CI, push, re-review</div></div>
+        <div class="step-line"></div>
+        <div class="flow-step"><div class="step-num">4</div><div class="step-text">Repeat until <span class="tag green">approved</span> or max iterations</div></div>
+      </div>
+    </div>
+  </div>
+  <pre style="margin-top:1em;"><code>claude-agent-runner <span class="flag">--auto-review</span>    <span class="cmt"># review only</span>
+claude-agent-runner <span class="flag">--auto-fix</span>       <span class="cmt"># review + fix loop</span></code></pre>
+</div>
+
+<!-- ======================================== SLIDE 10: FEEDBACK RESUME ======================================== -->
+<div class="slide" data-slide="9">
+  <h2>Feedback Resume</h2>
+  <p class="subtitle">Human-in-the-loop without starting over</p>
+  <div class="diagram" style="margin:1em 0 1.5em;">
+    <div class="box blue-border">
+      <div class="muted" style="font-size:0.8em;">1</div>
+      Human reviews PR<br>or comments on Linear
+    </div>
+    <div class="arrow">&rarr;</div>
+    <div class="box accent-border">
+      <div class="muted" style="font-size:0.8em;">2</div>
+      Re-add <span class="tag purple">Agent</span><br>label to issue
+    </div>
+    <div class="arrow">&rarr;</div>
+    <div class="box green-border">
+      <div class="muted" style="font-size:0.8em;">3</div>
+      Runner detects existing<br>worktree &rarr; resume mode
+    </div>
+    <div class="arrow">&rarr;</div>
+    <div class="box orange-border">
+      <div class="muted" style="font-size:0.8em;">4</div>
+      Claude resumes with<br><code>-r</code> (full history)
+    </div>
+  </div>
+  <div class="two-col">
+    <div>
+      <h3>Blocked resume</h3>
+      <p>Agent wrote a question file &rarr; developer answered in Linear comments &rarr; agent continues with the answer.</p>
+    </div>
+    <div>
+      <h3>Feedback resume</h3>
+      <p>PR got review comments &rarr; agent addresses each one with new commits, using the <code>-r</code> flag to retain previous session context.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ======================================== SLIDE 11: BLOCKING ======================================== -->
+<div class="slide" data-slide="10">
+  <h2>Blocking: When the Agent Gets Stuck</h2>
+  <div class="two-col">
+    <div>
+      <h3>Agent side</h3>
+      <p>When Claude needs human input, it:</p>
+      <div class="flow-steps" style="margin-top:0.6em;">
+        <div class="flow-step"><div class="step-num">1</div><div class="step-text">Creates <code>.claude/agent-blocked/ENG-123.md</code></div></div>
+        <div class="step-line"></div>
+        <div class="flow-step"><div class="step-num">2</div><div class="step-text">Commits partial work + blocked file</div></div>
+        <div class="step-line"></div>
+        <div class="flow-step"><div class="step-num">3</div><div class="step-text">Stops immediately</div></div>
+      </div>
+    </div>
+    <div>
+      <h3>Runner side</h3>
+      <p>Detects the blocked file and:</p>
+      <div class="flow-steps" style="margin-top:0.6em;">
+        <div class="flow-step"><div class="step-num">1</div><div class="step-text">Posts question to Linear as a comment</div></div>
+        <div class="step-line"></div>
+        <div class="flow-step"><div class="step-num">2</div><div class="step-text">Sets state back to <span class="tag orange">Todo</span></div></div>
+        <div class="step-line"></div>
+        <div class="flow-step"><div class="step-num">3</div><div class="step-text">Notifies Slack</div></div>
+      </div>
+    </div>
+  </div>
+  <pre style="margin-top:1.5em;"><code><span class="cmt"># Posted to Linear:</span>
+<span class="str">Reply to this comment, then re-add the "Agent" label to resume the agent.</span></code></pre>
+</div>
+
+<!-- ======================================== SLIDE 12: GUARDRAILS ======================================== -->
+<div class="slide top-align" data-slide="11">
+  <h2>Guardrail Hooks</h2>
+  <p style="margin-bottom:0.8em;">11 Claude Code hooks &mdash; gated by environment variables so they only activate during autonomous runs.</p>
+  <table>
+    <tr><th>Hook</th><th>Event</th><th>Gate</th><th>Purpose</th></tr>
+    <tr><td><code>block-destructive</code></td><td>PreToolUse:Bash</td><td><code>AGENT_MODE</code></td><td>Block <code>rm -rf</code>, force-push, <code>DROP TABLE</code>, etc.</td></tr>
+    <tr><td><code>scope-guard</code></td><td>PreToolUse:Bash</td><td><code>AGENT_SCOPED</code></td><td>Enforce file-write scope for subtasks</td></tr>
+    <tr><td><code>command-budget</code></td><td>PreToolUse:Bash</td><td><code>AGENT_MODE</code></td><td>Deny after N bash commands (default 300)</td></tr>
+    <tr><td><code>command-rewriter</code></td><td>PreToolUse:Bash</td><td><code>AGENT_MODE</code></td><td>Add <code>--save-exact</code> to npm install</td></tr>
+    <tr><td><code>auto-lint</code></td><td>PostToolUse:Edit|Write</td><td><code>AGENT_MODE</code></td><td>Async lint on file changes</td></tr>
+    <tr><td><code>stop-gate</code></td><td>Stop</td><td><code>AGENT_MODE</code></td><td>Block finish if no test evidence</td></tr>
+    <tr><td><code>task-validator</code></td><td>TaskCompleted</td><td><code>AGENT_MODE</code></td><td>Block task completion without tests</td></tr>
+    <tr><td><code>session-context</code></td><td>SessionStart</td><td><code>AGENT_MODE</code></td><td>Inject agent identity</td></tr>
+    <tr><td><code>pre-compact</code></td><td>PreCompact</td><td><code>AGENT_MODE</code></td><td>Save git snapshot before compaction</td></tr>
+    <tr><td><code>subagent-collector</code></td><td>SubagentStop</td><td><code>AGENT_SCOPED</code></td><td>Log subagent results to JSONL</td></tr>
+    <tr><td><code>rtk-failure-hint</code></td><td>PostToolUseFailure</td><td><em>always</em></td><td>Suggest <code>rtk proxy</code> on failure</td></tr>
+  </table>
+</div>
+
+<!-- ======================================== SLIDE 13: ORCHESTRATION ======================================== -->
+<div class="slide top-align" data-slide="12">
+  <h2>Orchestration: Multi-Agent</h2>
+  <p class="subtitle">For issues spanning multiple files/concerns</p>
+  <p style="margin-bottom:0.8em;">Trigger: issue labeled <span class="tag purple">Agent</span> + <span class="tag orange">Orchestrate</span></p>
+  <div class="three-col">
+    <div class="phase-card">
+      <h3>Phase 1 &mdash; Decompose</h3>
+      <p class="muted" style="font-size:0.9em;">Claude analyzes the issue, writes subtask JSON files with file scopes, skills, and dependencies.</p>
+    </div>
+    <div class="phase-card">
+      <h3>Phase 2 &mdash; Create Issues</h3>
+      <p class="muted" style="font-size:0.9em;">Subtask JSONs become Linear child issues with dependency relations and agent labels.</p>
+    </div>
+    <div class="phase-card">
+      <h3>Phase 3 &mdash; Supervise</h3>
+      <p class="muted" style="font-size:0.9em;">Polls Linear every 30s. Workers are picked up by the normal polling loop as scoped agents.</p>
+    </div>
+  </div>
+  <div class="two-col" style="margin-top:0.8em;">
+    <div class="phase-card">
+      <h3>Phase 4 &mdash; Integrate</h3>
+      <p class="muted" style="font-size:0.9em;">Pull all changes, run CI on the integrated result. Fix agent if needed.</p>
+    </div>
+    <div class="phase-card">
+      <h3>Phase 5 &mdash; Combined PR</h3>
+      <p class="muted" style="font-size:0.9em;">Single PR with merged reports from all subtasks. Posted to Linear + Slack.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ======================================== SLIDE 14: SCOPED WORKERS ======================================== -->
+<div class="slide" data-slide="13">
+  <h2>Scoped Workers</h2>
+  <p style="margin-bottom:1em;">Subtask agents are <strong>sandboxed to their assigned files</strong> via the scope-guard hook.</p>
+  <div class="two-col">
+    <div>
+      <pre><code><span class="cmt">// subtask-001.json</span>
+{
+  <span class="str">"id"</span>: <span class="str">"ST-1"</span>,
+  <span class="str">"title"</span>: <span class="str">"Add auth middleware"</span>,
+  <span class="str">"skill"</span>: <span class="str">"backend"</span>,
+  <span class="str">"scope"</span>: [
+    <span class="str">"src/middleware/auth.ts"</span>,
+    <span class="str">"src/lib/jwt.ts"</span>
+  ],
+  <span class="str">"off_limits"</span>: [<span class="str">"src/db/*"</span>],
+  <span class="str">"shared_files"</span>: [<span class="str">"src/types.ts"</span>],
+  <span class="str">"depends_on"</span>: []
+}</code></pre>
+    </div>
+    <div>
+      <h3>Enforcement</h3>
+      <ul>
+        <li><strong>Write</strong> only to files in <code>scope</code></li>
+        <li><strong>Read</strong> anything in the repo</li>
+        <li><strong>Shared files</strong> are read-only</li>
+        <li>If out-of-scope changes needed &rarr; write a scope-overflow document</li>
+      </ul>
+      <pre style="margin-top:0.8em;"><code><span class="kw">export</span> CLAUDE_AGENT_SCOPED=<span class="val">1</span>
+<span class="kw">export</span> CLAUDE_AGENT_SCOPE_FILE=<span class="str">"subtask.json"</span></code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ======================================== SLIDE 15: PIPELINE ======================================== -->
+<div class="slide" data-slide="14">
+  <h2>Pipeline: Requirements &rarr; Linear Issues</h2>
+  <pre><code>claude-agent-runner <span class="flag">--pipeline</span> requirements.md <span class="flag">--workspace</span> myco <span class="flag">--team</span> Engineering</code></pre>
+  <div class="flow-steps" style="margin:1.2em 0;">
+    <div class="flow-step"><div class="step-num">1</div><div class="step-text">Claude parses markdown into structured JSON (title, description, estimate, labels, dependencies)</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num">2</div><div class="step-text">Each story becomes a Linear issue with the <span class="tag purple">Agent</span> label</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num">3</div><div class="step-text">Dependencies become <code>isBlockedBy</code> relations in Linear</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num">4</div><div class="step-text">With <code class="flag">--sequenced</code>: dependent stories wait for blockers before getting labeled</div></div>
+  </div>
+  <pre><code><span class="cmt"># Preview without creating</span>
+claude-agent-runner <span class="flag">--pipeline</span> requirements.md <span class="flag">--dry-run</span></code></pre>
+</div>
+
+<!-- ======================================== SLIDE 16: SPEC ======================================== -->
+<div class="slide" data-slide="15">
+  <h2>Spec Generation: Idea &rarr; Requirements</h2>
+  <pre><code><span class="cmt"># Generate a spec from a freeform idea</span>
+claude-agent-runner <span class="flag">--spec</span> idea.md
+
+<span class="cmt"># Interactive: ask Claude clarifying questions</span>
+claude-agent-runner <span class="flag">--spec</span> idea.md <span class="flag">--interactive</span>
+
+<span class="cmt"># Generate spec AND create Linear issues in one shot</span>
+claude-agent-runner <span class="flag">--spec</span> idea.md <span class="flag">--create</span></code></pre>
+  <div class="diagram" style="margin:1.5em 0;">
+    <div class="box accent-border">
+      <div class="muted" style="font-size:0.8em;">idea.md</div>
+      <div>"Add dark mode"</div>
+    </div>
+    <div class="arrow">&rarr;</div>
+    <div class="box" style="border-color:var(--cyan);">
+      <div class="muted" style="font-size:0.8em;">--spec</div>
+      <div>Structured spec</div>
+    </div>
+    <div class="arrow">&rarr;</div>
+    <div class="box green-border">
+      <div class="muted" style="font-size:0.8em;">--create chains to</div>
+      <div>--pipeline</div>
+    </div>
+    <div class="arrow">&rarr;</div>
+    <div class="box blue-border">
+      <div class="muted" style="font-size:0.8em;">Linear</div>
+      <div>Sized stories</div>
+    </div>
+  </div>
+  <p class="muted">The spec generator reads the project's CLAUDE.md, so generated stories are aware of the codebase's stack and conventions.</p>
+</div>
+
+<!-- ======================================== SLIDE 17: OBSERVABILITY ======================================== -->
+<div class="slide top-align" data-slide="16">
+  <h2>Observability</h2>
+  <div class="two-col">
+    <div>
+      <h3>JSONL Event Traces</h3>
+      <p style="font-size:0.95em;">~30 event types across 7 categories per issue run.</p>
+      <pre style="font-size:0.8em;"><code><span class="cmt"># CLI</span>
+agent-trace list          <span class="cmt"># all traces</span>
+agent-trace show ENG-123  <span class="cmt"># pretty-print</span>
+agent-trace tail ENG-123  <span class="cmt"># live tail</span>
+agent-trace view          <span class="cmt"># browser viewer</span></code></pre>
+      <h3 style="margin-top:1em;">Timeline Viewer</h3>
+      <ul>
+        <li>Single-file HTML (no build, no CDN)</li>
+        <li>Color-coded vertical timeline</li>
+        <li>Filter chips, search, auto-refresh</li>
+        <li>Swimlane view for orchestrated issues</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Other channels</h3>
+      <table>
+        <tr><th>Channel</th><th>Location</th></tr>
+        <tr><td>Per-issue logs</td><td><code>~/.config/claude-agents/logs/</code></td></tr>
+        <tr><td>CI attempt logs</td><td><code>...-ci-1.log</code>, <code>...-ci-2.log</code></td></tr>
+        <tr><td>Slack</td><td>Real-time at key lifecycle events</td></tr>
+        <tr><td>Linear</td><td>Status comments on the issue</td></tr>
+      </table>
+      <pre style="font-size:0.85em;margin-top:1em;"><code><span class="cmt"># Quick status check</span>
+claude-agent-runner <span class="flag">--status</span></code></pre>
+      <p class="muted" style="font-size:0.9em;">Shows active agents, PIDs, issues, and pending counts.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ======================================== SLIDE 18: SKILLS ======================================== -->
+<div class="slide" data-slide="17">
+  <h2>Agent Skills</h2>
+  <p style="margin-bottom:1em;">Structured prompts that guide Claude through specific workflows. Installed to <code>~/.claude/skills/</code>.</p>
+  <div class="three-col">
+    <div>
+      <h3>Core workflow</h3>
+      <table>
+        <tr><td><code>implement</code></td><td>Plan &rarr; test &rarr; code &rarr; validate</td></tr>
+        <tr><td><code>orchestrate</code></td><td>Decompose into subtasks</td></tr>
+        <tr><td><code>scoped-worker</code></td><td>Scope-aware implementation</td></tr>
+        <tr><td><code>ci-fix</code></td><td>Diagnose CI failures</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>Analysis</h3>
+      <table>
+        <tr><td><code>debug</code></td><td>Reproduce &rarr; isolate &rarr; fix</td></tr>
+        <tr><td><code>data-flow</code></td><td>Trace data across stack</td></tr>
+        <tr><td><code>review-pr</code></td><td>Structured PR review</td></tr>
+        <tr><td><code>simplify</code></td><td>Find over-engineering</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>Planning</h3>
+      <table>
+        <tr><td><code>spec-writer</code></td><td>Idea &rarr; structured spec</td></tr>
+        <tr><td><code>agent-report</code></td><td>Implementation summary</td></tr>
+        <tr><td><code>blocked</code></td><td>File blocking questions</td></tr>
+        <tr><td><code>backend</code> / <code>frontend</code></td><td>Domain guidance</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ======================================== SLIDE 19: END TO END ======================================== -->
+<div class="slide top-align" data-slide="18">
+  <h2>End-to-End Example</h2>
+  <div class="flow-steps">
+    <div class="flow-step"><div class="step-num" style="background:var(--blue);">1</div><div class="step-text">Developer creates Linear issue: <em>"Add dark mode toggle to settings page"</em></div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num" style="background:var(--blue);">2</div><div class="step-text">Developer adds the <span class="tag purple">Agent</span> label</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num" style="background:var(--accent);">3</div><div class="step-text">Cron fires &rarr; runner polls Linear &rarr; picks up the issue</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num" style="background:var(--accent);">4</div><div class="step-text">Creates worktree, starts DB, spawns Claude</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num" style="background:var(--green);">5</div><div class="step-text">Claude reads codebase, writes tests, implements, commits</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num" style="background:var(--orange);">6</div><div class="step-text">CI gate passes (tsc + vitest + next build)</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num" style="background:var(--green);">7</div><div class="step-text">Push branch, create draft PR, post to Linear + Slack</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num" style="background:var(--cyan);">8</div><div class="step-text">Auto-review catches missing <code>aria-label</code> &rarr; auto-fix adds it &rarr; re-review approves</div></div>
+    <div class="step-line"></div>
+    <div class="flow-step"><div class="step-num" style="background:var(--blue);">9</div><div class="step-text">Developer reviews, merges. Next cleanup cycle removes the worktree.</div></div>
+  </div>
+</div>
+
+<!-- ======================================== SLIDE 20: CLOSING ======================================== -->
+<div class="slide" data-slide="19">
+  <h1>Summary</h1>
+  <div class="two-col" style="margin-top:1em;">
+    <div>
+      <ul>
+        <li><strong>Stateless orchestrator</strong> &mdash; cron-friendly, all state external</li>
+        <li><strong>Isolated worktrees</strong> &mdash; no conflicts between agents</li>
+        <li><strong>11 guardrail hooks</strong> &mdash; destructive-command blocking, scope enforcement, test requirements</li>
+        <li><strong>Multi-agent orchestration</strong> &mdash; decompose, supervise, integrate</li>
+      </ul>
+    </div>
+    <div>
+      <ul>
+        <li><strong>CI retry loop</strong> &mdash; self-healing on failures</li>
+        <li><strong>Feedback resume</strong> &mdash; human-in-the-loop without restarting</li>
+        <li><strong>Pipeline &amp; spec</strong> &mdash; idea &rarr; spec &rarr; issues &rarr; PRs</li>
+        <li><strong>Full observability</strong> &mdash; traces, logs, Slack, timeline viewer</li>
+      </ul>
+    </div>
+  </div>
+  <hr style="margin-top:2em;">
+  <p class="muted" style="margin-top:1em;">~2,500 lines of bash. No framework. No build step.</p>
+</div>
+
+</div><!-- /deck -->
+
+<!-- Progress bar -->
+<div class="progress" id="progress"></div>
+<div class="counter" id="counter"></div>
+<div class="nav-hint">Arrow keys or click to navigate</div>
+
+<script>
+(function() {
+  const slides = document.querySelectorAll('.slide');
+  const total = slides.length;
+  let current = 0;
+
+  function go(n) {
+    if (n < 0 || n >= total) return;
+    slides[current].classList.remove('active');
+    current = n;
+    slides[current].classList.add('active');
+    document.getElementById('progress').style.width = ((current + 1) / total * 100) + '%';
+    document.getElementById('counter').textContent = (current + 1) + ' / ' + total;
+  }
+
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === ' ') { e.preventDefault(); go(current + 1); }
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); go(current - 1); }
+    if (e.key === 'Home') { e.preventDefault(); go(0); }
+    if (e.key === 'End') { e.preventDefault(); go(total - 1); }
+  });
+
+  document.addEventListener('click', function(e) {
+    if (e.clientX > window.innerWidth / 2) go(current + 1);
+    else go(current - 1);
+  });
+
+  // Touch swipe
+  let touchStartX = 0;
+  document.addEventListener('touchstart', function(e) { touchStartX = e.changedTouches[0].screenX; });
+  document.addEventListener('touchend', function(e) {
+    const dx = e.changedTouches[0].screenX - touchStartX;
+    if (Math.abs(dx) > 50) { dx < 0 ? go(current + 1) : go(current - 1); }
+  });
+
+  go(0);
+})();
+</script>
+</body>
+</html>

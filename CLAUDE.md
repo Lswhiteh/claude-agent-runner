@@ -66,6 +66,7 @@ setup.sh                    One-command install: symlinks, hooks, skills, config
 - **Guardrails**: Exports CLAUDE_AGENT_MODE=1 for block-destructive.sh; CLAUDE_AGENT_SCOPED=1 for scope-guard.sh
 - **Agent identity**: Exports CLAUDE_AGENT_ISSUE_ID, CLAUDE_AGENT_REPO, CLAUDE_AGENT_BRANCH, CLAUDE_AGENT_WORKTREE at all claude invocation sites
 - **Event tracing**: JSONL event traces at `~/.config/claude-agents/traces/` — one file per issue, ~30 events across 7 categories (issue, agent, orchestration, CI, PR, review, cleanup)
+- **Note**: `orchestrator.auto` is loaded from config but currently unused (dead field)
 
 ### ci-gate
 - Reads `.ci-gate` file if present, otherwise auto-detects project type
@@ -159,3 +160,8 @@ setup.sh                    One-command install: symlinks, hooks, skills, config
 - All hooks use the gate pattern: check env var, exit 0 early if inactive
 - setup.sh must remain idempotent — always check before overwriting
 - Orchestration detection uses Linear labels (not description markers) — `Orchestrate` label triggers decomposition, `parent.id` field identifies subtasks
+
+## Documentation
+
+- [docs/walkthrough.md](docs/walkthrough.md) — full linear narrative of every flow
+- [docs/walkthrough-slides.html](docs/walkthrough-slides.html) — 20-slide HTML presentation (open in browser, no dependencies)
