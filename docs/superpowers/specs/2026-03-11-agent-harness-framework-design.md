@@ -708,6 +708,54 @@ config/
 - **Baseline metrics:** v1 shows current rates only. "Before/after" comparisons deferred until baseline snapshot mechanism is designed.
 - **lib/ extraction:** Deferred. Dispatch duplicates needed functions initially; consolidation follows once shared interface is clear.
 
+## Roadmap: Workflow Enforcement + Skill Migration
+
+### Phase 1: Keep superpowers for interactive sessions only
+
+Superpowers plugin is useful for developer-in-the-loop brainstorming and plan writing. Do NOT load it into agent-runner sessions — autonomous agents don't need brainstorming, and the enforcement overhead (hundreds of tokens of meta-skill context per session) is wasteful. The runner's hooks provide deterministic enforcement that's cheaper and more reliable.
+
+### Phase 2: Port useful skill content
+
+Port the 2-3 genuinely valuable superpowers skill *contents* into the project's own `skills/` directory:
+- Brainstorming flow (the structured design process, not the enforcement wrapper)
+- Plan review prompts (the reviewer prompt templates, not the loop machinery)
+- Keep existing project skills as-is (implement, orchestrate, scoped-worker, etc.)
+
+### Phase 3: Workflow enforcement in enforcement.yaml
+
+Add a `workflows` section to enforcement.yaml that deterministically enforces skill usage via hooks:
+
+```yaml
+workflows:
+  - name: tdd-required
+    skill: implement
+    trigger: session-start       # auto-inject on issue work
+    mode: auto-invoke
+    evidence: "tests/**/*.test.ts"
+
+  - name: report-before-done
+    skill: agent-report
+    trigger: pre-completion
+    mode: block                  # block completion without artifact
+    evidence: ".claude/agent-reports/*.md"
+
+  - name: fix-ci-failures
+    skill: ci-fix
+    trigger: ci-failed
+    mode: auto-invoke
+```
+
+Three enforcement modes:
+- **`auto-invoke`** — Hook injects skill content into agent context automatically (zero-token when not triggered)
+- **`block`** — Block completion without evidence artifact
+- **`warn`** — Inject context suggesting the skill
+
+This replaces `using-superpowers` entirely. Instead of LLM-mediated "did you remember to check for skills?", hooks deterministically inject the right workflow. Cheaper, more reliable, project-configurable.
+
+### Phase 4: Drop superpowers dependency
+
+Once workflow enforcement is proven, superpowers becomes redundant. All useful content lives in project skills, all enforcement is deterministic via hooks. The plugin can be removed.
+
 ## References
 
 - [Agent Backpressure](https://latentpatterns.com/glossary/agent-backpressure) — automated feedback mechanisms for agent self-correction
