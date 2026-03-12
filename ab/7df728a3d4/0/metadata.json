@@ -1,0 +1,38 @@
+{
+  "cli_version": "0.4.9",
+  "checkpoint_id": "ab7df728a3d4",
+  "session_id": "3e21dd0a-8654-422a-baf5-22cd28952e84",
+  "strategy": "manual-commit",
+  "created_at": "2026-03-12T20:20:58.695704Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "CLAUDE.md",
+    "README.md",
+    "bin/agent-trace",
+    "bin/car",
+    "bin/ci-gate",
+    "bin/claude-agent-runner",
+    "docs/walkthrough-slides.html",
+    "docs/walkthrough.md",
+    "setup.sh"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "c4f9aa3d7037",
+  "token_usage": {
+    "input_tokens": 2499,
+    "cache_creation_tokens": 58567,
+    "cache_read_tokens": 1784864,
+    "output_tokens": 11613,
+    "api_call_count": 34
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-03-12T20:20:57.654698Z",
+    "agent_lines": 2555,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 2555,
+    "agent_percentage": 100
+  }
+}
